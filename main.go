@@ -1,43 +1,68 @@
 package main
 
 import (
-	"bufio" //функции для работы с буферизованным вводом и выводом. В данном случае он будет использоваться для чтения данных из сетевого соединения
 	"fmt"
-	"net"
+	"log"
+	"net/http"
+	"sync"
+
+	"github.com/gorilla/websocket"
 )
 
+var upgrader = websocket.Upgrader{
+	CheckOrigin: func(r *http.Request) bool {
+		return true
+	},
+}
+
+var clients = make(map[*websocket.Conn]bool)
+var clientsMu sync.Mutex
+
 func main() {
-	fmt.Println("Запуск сервера...")
+	http.HandleFunc("/ws", handleWebSocket)
+	fmt.Println("Сервер запущен на :8080")
+	log.Fatal(http.ListenAndServe(":8080", nil))
 
-	listener, err := net.Listen("tcp", ":8080") //Создает TCP-сервер, который будет слушать входящие соединения на порту 8080.
-	if err != nil {                             // ошибка при запуске сервера (например, порт уже занят)
-		fmt.Println("Ошибка при запуске сервера:", err)
-		return
-	}
-	defer listener.Close() //Отложенный вызов метода Close() на listener, который будет выполнен в конце функции main. гарантирует: серверный сокет будет закрыт, когда программа завершится, освобождая ресурсы.
-
-	fmt.Println("Ожидание подключения клиента...")
-
-	// Принимаем подключение от клиента
-	conn, err := listener.Accept() /* функция блокирует выполнение программы до тех пор, пока не произойдет новое соединение.
-	Если соединение успешно установлено, оно сохраняется в переменной conn, а ошибка (если она произошла) — в переменной*/
+}
+func handleWebSocket(w http.ResponseWriter, r *http.Request) {
+	conn, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
-		fmt.Println("Ошибка при принятии соединения:", err)
+		log.Println("Ошибка при обновлении соединения:", err)
 		return
 	}
 	defer conn.Close()
 
-	fmt.Println("Клиент подключен.")
+	clientsMu.Lock()
+	clients[conn] = true
+	clientsMu.Unlock()
 
-	// Читаем сообщения от клиента
-	scanner := bufio.NewScanner(conn) /*Создает новый сканер, который будет читать данные из соединения conn*/
-	for scanner.Scan() {
-		message := scanner.Text()
-		fmt.Println("Получено сообщение:", message)
-	}
+	fmt.Println("Новый клиент подключен")
 
-	if err := scanner.Err(); err != nil { /*произошла ли ошибка во время чтения данных.
-		  Метод Err() возвращает ошибку, если она произошла во время сканирования. */
-		fmt.Println("Ошибка при чтении сообщения:", err)
+	for {
+		_, message, err := conn.ReadMessage()
+		if err != nil {
+			log.Println("Ошибка при чтении сообщения:", err)
+			break
+		}
+
+		fmt.Printf("Получено сообщение: %s\n", message)
+
+		// Пересылаем сообщение всем клиентам
+		clientsMu.Lock()
+		for client := range clients {
+			if client != conn {
+				err := client.WriteMessage(websocket.TextMessage, message)
+				if err != nil {
+					log.Println("Ошибка при отправке сообщения:", err)
+					client.Close()
+					delete(clients, client)
+				}
+			}
+		}
+		clientsMu.Unlock()
 	}
+	clientsMu.Lock()
+	delete(clients, conn)
+	clientsMu.Unlock()
+	fmt.Println("Клиент отключен")
 }
