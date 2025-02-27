@@ -81,16 +81,19 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 			// Пересылаем сообщение только клиентам в том же чате
 			clientsMu.Lock()
 			for client := range clients {
-				if client != conn {
-					// Кодируем сообщение с isMe
-					messageWithIsMe, _ := json.Marshal(msgDataMap)
-					err := client.WriteMessage(websocket.TextMessage, messageWithIsMe)
-					if err != nil {
-						log.Println("Ошибка при отправке сообщения:", err)
-						client.Close()
-						delete(clients, client)
-					}
+				// Определяем, является ли текущий клиент отправителем
+				isMe := (client == conn)
+				msgDataMap["isMe"] = isMe // Добавляем флаг
+				//if client != conn {
+				// Кодируем сообщение с isMe
+				messageWithIsMe, _ := json.Marshal(msgDataMap)
+				err := client.WriteMessage(websocket.TextMessage, messageWithIsMe)
+				if err != nil {
+					log.Println("Ошибка при отправке сообщения:", err)
+					client.Close()
+					delete(clients, client)
 				}
+				//	}
 			}
 			clientsMu.Unlock()
 		}

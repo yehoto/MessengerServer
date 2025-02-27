@@ -278,7 +278,7 @@ func messagesHandler(w http.ResponseWriter, r *http.Request) {
         SELECT id, content, created_at, user_id, is_system 
         FROM messages 
         WHERE chat_id = $1 
-        ORDER BY created_at DESC
+        ORDER BY created_at ASC
     `, chatID)
 	if err != nil {
 		http.Error(w, "Query error: "+err.Error(), http.StatusInternalServerError)
