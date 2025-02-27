@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
 	"log"
 	"net/http"
@@ -43,31 +44,56 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		fmt.Printf("Получено сообщение: %s\n", message)
 
 		// Сохраняем сообщение в базе данных
-		db, err := connectDB()
-		if err != nil {
-			log.Println("Ошибка подключения к базе данных:", err)
-			continue
-		}
-		defer db.Close()
-
-		_, err = db.Exec("INSERT INTO messages (user_id, message) VALUES ($1, $2)", 1, string(message)) // user_id должен быть получен из сессии
-		if err != nil {
-			log.Println("Ошибка при сохранении сообщения:", err)
+		// В handleWebSocket
+		var msgData struct {
+			ChatID int    `json:"chat_id"`
+			UserID int    `json:"user_id"`
+			Text   string `json:"text"`
 		}
 
-		// Пересылаем сообщение всем клиентам
-		clientsMu.Lock()
-		for client := range clients {
-			if client != conn {
-				err := client.WriteMessage(websocket.TextMessage, message)
-				if err != nil {
-					log.Println("Ошибка при отправке сообщения:", err)
-					client.Close()
-					delete(clients, client)
+		if err := json.Unmarshal(message, &msgData); err == nil {
+			db, err := connectDB()
+			if err != nil {
+				log.Println("Ошибка подключения к базе данных:", err)
+				return
+			}
+			defer db.Close()
+
+			// Сохраняем сообщение в базе данных
+			_, err = db.Exec(
+				"INSERT INTO messages (chat_id, user_id, content) VALUES ($1, $2, $3)",
+				msgData.ChatID,
+				msgData.UserID,
+				msgData.Text,
+			)
+			if err != nil {
+				log.Println("Ошибка при сохранении сообщения:", err)
+			}
+
+			// Добавляем isMe в сообщение
+			msgDataMap := map[string]interface{}{
+				"chat_id": msgData.ChatID,
+				"user_id": msgData.UserID,
+				"text":    msgData.Text,
+				"isMe":    false, // По умолчанию false, так как это сообщение от другого пользователя
+			}
+
+			// Пересылаем сообщение только клиентам в том же чате
+			clientsMu.Lock()
+			for client := range clients {
+				if client != conn {
+					// Кодируем сообщение с isMe
+					messageWithIsMe, _ := json.Marshal(msgDataMap)
+					err := client.WriteMessage(websocket.TextMessage, messageWithIsMe)
+					if err != nil {
+						log.Println("Ошибка при отправке сообщения:", err)
+						client.Close()
+						delete(clients, client)
+					}
 				}
 			}
+			clientsMu.Unlock()
 		}
-		clientsMu.Unlock()
 	}
 
 	clientsMu.Lock()

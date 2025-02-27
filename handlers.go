@@ -3,6 +3,9 @@ package main
 import (
 	"database/sql"
 	"encoding/json"
+	"strconv"
+	"time"
+
 	//"database/sql"
 	//"github.com/gorilla/websocket"
 	"golang.org/x/crypto/bcrypt"
@@ -96,7 +99,22 @@ func usersHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	defer db.Close()
 
-	rows, err := db.Query("SELECT id, username FROM users")
+	//rows, err := db.Query("SELECT id, username FROM users")
+	currentUserID := r.URL.Query().Get("current_user_id")
+
+	rows, err := db.Query(`
+        SELECT u.id, u.username 
+        FROM users u
+        WHERE u.id != $1 
+        AND NOT EXISTS (
+            SELECT 1 
+            FROM participants p1
+            JOIN participants p2 ON p1.chat_id = p2.chat_id 
+            WHERE p1.user_id = $1 
+            AND p2.user_id = u.id
+        )
+    `, currentUserID)
+
 	if err != nil {
 		http.Error(w, "Query error", http.StatusInternalServerError)
 		return
@@ -234,4 +252,76 @@ func createChatHandler(w http.ResponseWriter, r *http.Request) {
 
 	tx.Commit()
 	json.NewEncoder(w).Encode(map[string]int{"chatId": chatID})
+}
+
+func messagesHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "GET" {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	chatID := r.URL.Query().Get("chat_id")
+	currentUserID := r.URL.Query().Get("user_id") // Добавляем ID текущего пользователя
+	if chatID == "" || currentUserID == "" {
+		http.Error(w, "Chat ID and User ID are required", http.StatusBadRequest)
+		return
+	}
+
+	db, err := connectDB()
+	if err != nil {
+		http.Error(w, "Database error", http.StatusInternalServerError)
+		return
+	}
+	defer db.Close()
+
+	rows, err := db.Query(`
+        SELECT id, content, created_at, user_id, is_system 
+        FROM messages 
+        WHERE chat_id = $1 
+        ORDER BY created_at DESC
+    `, chatID)
+	if err != nil {
+		http.Error(w, "Query error: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	defer rows.Close()
+
+	var messages []map[string]interface{}
+	for rows.Next() {
+		var id int
+		var content string
+		var createdAt time.Time
+		var userID sql.NullInt64
+		var isSystem bool
+
+		if err := rows.Scan(&id, &content, &createdAt, &userID, &isSystem); err != nil {
+			log.Println("Error scanning message row:", err)
+			continue
+		}
+
+		// Вычисляем isMe
+		//isMe := userID.Int64 == currentUserID
+		// Вычисляем isMe
+		userIDInt64 := userID.Int64
+		currentUserIDInt64, err := strconv.ParseInt(currentUserID, 10, 64)
+		if err != nil {
+			log.Println("Error converting currentUserID to int64:", err)
+			continue // or handle error differently, e.g., set isMe to false
+		}
+
+		isMe := userIDInt64 == currentUserIDInt64
+
+		messages = append(messages, map[string]interface{}{
+			"id":         id,
+			"text":       content,
+			"created_at": createdAt,
+			"user_id":    userID.Int64,
+			"is_system":  isSystem,
+			"isMe":       isMe, // Добавляем isMe
+		})
+		log.Println(messages)
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(messages)
 }
