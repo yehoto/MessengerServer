@@ -1,6 +1,8 @@
 package main
 
 import (
+	"database/sql"
+	"encoding/json"
 	//"database/sql"
 	//"github.com/gorilla/websocket"
 	"golang.org/x/crypto/bcrypt"
@@ -45,7 +47,6 @@ func registerHandler(w http.ResponseWriter, r *http.Request) {
 	w.Write([]byte("Пользователь зарегистрирован"))
 }
 
-// loginHandler обрабатывает запрос на вход
 func loginHandler(w http.ResponseWriter, r *http.Request) {
 	username := r.FormValue("username")
 	password := r.FormValue("password")
@@ -57,8 +58,13 @@ func loginHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	defer db.Close()
 
-	var storedPassword string
-	err = db.QueryRow("SELECT password FROM users WHERE username = $1", username).Scan(&storedPassword)
+	var (
+		storedPassword string
+		userID         int
+	)
+
+	// Добавляем получение ID пользователя
+	err = db.QueryRow("SELECT id, password FROM users WHERE username = $1", username).Scan(&userID, &storedPassword)
 	if err != nil {
 		http.Error(w, "Пользователь не найден", http.StatusUnauthorized)
 		return
@@ -70,6 +76,162 @@ func loginHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	w.WriteHeader(http.StatusOK)
-	w.Write([]byte("Вход выполнен"))
+	// Возвращаем JSON с ID пользователя
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"message": "Вход выполнен",
+		"userId":  userID,
+	})
+}
+func usersHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "GET" {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	db, err := connectDB()
+	if err != nil {
+		http.Error(w, "Database error", http.StatusInternalServerError)
+		return
+	}
+	defer db.Close()
+
+	rows, err := db.Query("SELECT id, username FROM users")
+	if err != nil {
+		http.Error(w, "Query error", http.StatusInternalServerError)
+		return
+	}
+	defer rows.Close()
+
+	var users []map[string]interface{}
+	for rows.Next() {
+		var id int
+		var username string
+		if err := rows.Scan(&id, &username); err != nil {
+			continue
+		}
+		users = append(users, map[string]interface{}{"id": id, "username": username})
+	}
+
+	json.NewEncoder(w).Encode(users)
+}
+
+func chatsHandler(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case "GET":
+		getChatsHandler(w, r)
+	case "POST":
+		createChatHandler(w, r)
+	default:
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+func getChatsHandler(w http.ResponseWriter, r *http.Request) {
+	currentUserID := r.URL.Query().Get("user_id")
+	if currentUserID == "" {
+		http.Error(w, "User ID is required", http.StatusBadRequest)
+		return
+	}
+
+	db, err := connectDB()
+	if err != nil {
+		http.Error(w, "Database error", http.StatusInternalServerError)
+		return
+	}
+	defer db.Close()
+
+	rows, err := db.Query(`
+        SELECT 
+            c.id AS chat_id,
+            c.last_message_at,
+            p.unread_count,
+            m.content AS last_message,
+            u.username AS partner_username
+        FROM participants p
+        JOIN chats c ON p.chat_id = c.id
+        LEFT JOIN messages m ON c.last_message_at = m.created_at
+        JOIN participants p2 ON p2.chat_id = c.id AND p2.user_id != $1
+        JOIN users u ON u.id = p2.user_id
+        WHERE p.user_id = $1
+        ORDER BY c.last_message_at DESC
+    `, currentUserID)
+	if err != nil {
+		http.Error(w, "Query error: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	defer rows.Close()
+
+	var chats []map[string]interface{}
+	for rows.Next() {
+		var chatID int
+		var lastMessage sql.NullString
+		var unreadCount int
+		var timestamp sql.NullTime
+		var partnerUsername string
+		if err := rows.Scan(&chatID, &timestamp, &unreadCount, &lastMessage, &partnerUsername); err != nil {
+			log.Println("Ошибка сканирования строки:", err)
+			continue
+		}
+		chats = append(chats, map[string]interface{}{
+			"id":          chatID,
+			"lastMessage": lastMessage.String,
+			"unread":      unreadCount,
+			"timestamp":   timestamp.Time,
+			"username":    partnerUsername, // Имя собеседника
+		})
+	}
+
+	// Всегда возвращаем JSON, даже если список пуст
+	w.Header().Set("Content-Type", "application/json")
+	if chats == nil {
+		chats = []map[string]interface{}{} // Пустой список
+	}
+	json.NewEncoder(w).Encode(chats)
+}
+
+func createChatHandler(w http.ResponseWriter, r *http.Request) {
+	// Получаем ID текущего пользователя из параметров запроса
+	currentUserID := r.FormValue("current_user_id")
+	targetUserID := r.FormValue("user_id")
+
+	//currentUserID := 1 // TODO: Заменить на реальный ID
+	//targetUserID := r.FormValue("user_id")
+
+	db, err := connectDB()
+	if err != nil {
+		http.Error(w, "Database error", http.StatusInternalServerError)
+		return
+	}
+	defer db.Close()
+
+	tx, err := db.Begin()
+	if err != nil {
+		http.Error(w, "Transaction error", http.StatusInternalServerError)
+		return
+	}
+
+	var chatID int
+	if err := tx.QueryRow("INSERT INTO chats DEFAULT VALUES RETURNING id").Scan(&chatID); err != nil {
+		tx.Rollback()
+		http.Error(w, "Chat creation failed", http.StatusInternalServerError)
+		return
+	}
+
+	if _, err := tx.Exec("INSERT INTO participants (chat_id, user_id) VALUES ($1, $2), ($1, $3)",
+		chatID, currentUserID, targetUserID); err != nil {
+		tx.Rollback()
+		http.Error(w, "Participants error", http.StatusInternalServerError)
+		return
+	}
+
+	if _, err := tx.Exec("INSERT INTO messages (chat_id, content, is_system) VALUES ($1, $2, true)",
+		chatID, "Чат создан"); err != nil {
+		tx.Rollback()
+		http.Error(w, "System message error", http.StatusInternalServerError)
+		return
+	}
+
+	tx.Commit()
+	json.NewEncoder(w).Encode(map[string]int{"chatId": chatID})
 }
