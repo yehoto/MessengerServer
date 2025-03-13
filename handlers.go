@@ -3,6 +3,7 @@ package main
 import (
 	"database/sql"
 	"encoding/json"
+	"io"
 	"strconv"
 	"time"
 
@@ -15,39 +16,61 @@ import (
 
 // registerHandler обрабатывает запрос на регистрацию
 func registerHandler(w http.ResponseWriter, r *http.Request) {
+	// Ограничиваем размер файла до 5MB
+	r.ParseMultipartForm(5 << 20)
+
 	username := r.FormValue("username")
 	password := r.FormValue("password")
+	name := r.FormValue("name")
+	bio := r.FormValue("bio")
 
-	// Логируем полученные данные
-	log.Println("Регистрация: username=", username, "password=", password)
+	// Обработка файла изображения
+	file, _, err := r.FormFile("image")
+	var imageBytes []byte
+	if err == nil {
+		defer file.Close()
+		imageBytes, err = io.ReadAll(file)
+		if err != nil {
+			http.Error(w, "Error reading image", http.StatusBadRequest)
+			return
+		}
+	}
+
+	// Валидация обязательных полей
+	if username == "" || name == "" {
+		http.Error(w, "Username and name are required", http.StatusBadRequest)
+		return
+	}
 
 	hashedPassword, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
 	if err != nil {
-		log.Println("Ошибка при хешировании пароля:", err)
-		http.Error(w, "Ошибка при хешировании пароля", http.StatusInternalServerError)
+		http.Error(w, "Password hashing failed", http.StatusInternalServerError)
 		return
 	}
 
 	db, err := connectDB()
 	if err != nil {
-		log.Println("Ошибка подключения к базе данных:", err)
-		http.Error(w, "Ошибка подключения к базе данных", http.StatusInternalServerError)
+		http.Error(w, "Database connection failed", http.StatusInternalServerError)
 		return
 	}
 	defer db.Close()
 
-	// Логируем SQL-запрос
-	log.Println("Выполнение запроса: INSERT INTO users (username, password) VALUES ($1, $2)", username, string(hashedPassword))
+	_, err = db.Exec(
+		"INSERT INTO users (username, password, name, bio, image) VALUES ($1, $2, $3, $4, $5)",
+		username,
+		string(hashedPassword),
+		name,
+		bio,
+		imageBytes,
+	)
 
-	_, err = db.Exec("INSERT INTO users (username, password) VALUES ($1, $2)", username, string(hashedPassword))
 	if err != nil {
-		log.Println("Ошибка при регистрации:", err)
-		http.Error(w, "Ошибка при регистрации: "+err.Error(), http.StatusInternalServerError)
+		http.Error(w, "Registration failed: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
 
 	w.WriteHeader(http.StatusOK)
-	w.Write([]byte("Пользователь зарегистрирован"))
+	w.Write([]byte("User registered successfully"))
 }
 
 func loginHandler(w http.ResponseWriter, r *http.Request) {
@@ -165,7 +188,8 @@ func getChatsHandler(w http.ResponseWriter, r *http.Request) {
             c.last_message_at,
             p.unread_count,
             m.content AS last_message,
-            u.username AS partner_username
+            u.name AS partner_name,
+            u.id AS partner_id
         FROM participants p
         JOIN chats c ON p.chat_id = c.id
         LEFT JOIN messages m ON c.last_message_at = m.created_at
@@ -174,6 +198,7 @@ func getChatsHandler(w http.ResponseWriter, r *http.Request) {
         WHERE p.user_id = $1
         ORDER BY c.last_message_at DESC
     `, currentUserID)
+
 	if err != nil {
 		http.Error(w, "Query error: "+err.Error(), http.StatusInternalServerError)
 		return
@@ -182,30 +207,64 @@ func getChatsHandler(w http.ResponseWriter, r *http.Request) {
 
 	var chats []map[string]interface{}
 	for rows.Next() {
-		var chatID int
-		var lastMessage sql.NullString
-		var unreadCount int
-		var timestamp sql.NullTime
-		var partnerUsername string
-		if err := rows.Scan(&chatID, &timestamp, &unreadCount, &lastMessage, &partnerUsername); err != nil {
+		var (
+			chatID      int
+			timestamp   sql.NullTime
+			unreadCount int
+			lastMessage sql.NullString
+			partnerName string
+			partnerID   int
+		)
+
+		// Порядок должен точно соответствовать SELECT
+		if err := rows.Scan(
+			&chatID,
+			&timestamp,
+			&unreadCount,
+			&lastMessage,
+			&partnerName,
+			&partnerID,
+		); err != nil {
 			log.Println("Ошибка сканирования строки:", err)
 			continue
 		}
+
 		chats = append(chats, map[string]interface{}{
-			"id":          chatID,
-			"lastMessage": lastMessage.String,
-			"unread":      unreadCount,
-			"timestamp":   timestamp.Time,
-			"username":    partnerUsername, // Имя собеседника
+			"id":           chatID,
+			"lastMessage":  lastMessage.String,
+			"unread":       unreadCount,
+			"timestamp":    timestamp.Time,
+			"partner_name": partnerName,
+			"partner_id":   partnerID,
 		})
 	}
 
-	// Всегда возвращаем JSON, даже если список пуст
 	w.Header().Set("Content-Type", "application/json")
 	if chats == nil {
-		chats = []map[string]interface{}{} // Пустой список
+		chats = []map[string]interface{}{}
 	}
 	json.NewEncoder(w).Encode(chats)
+}
+
+func userImageHandler(w http.ResponseWriter, r *http.Request) {
+	userID := r.URL.Query().Get("id")
+
+	db, err := connectDB()
+	if err != nil {
+		http.Error(w, "Database error", http.StatusInternalServerError)
+		return
+	}
+	defer db.Close()
+
+	var imageBytes []byte
+	err = db.QueryRow("SELECT image FROM users WHERE id = $1", userID).Scan(&imageBytes)
+	if err != nil || len(imageBytes) == 0 {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+
+	w.Header().Set("Content-Type", "image/jpeg")
+	w.Write(imageBytes)
 }
 
 func createChatHandler(w http.ResponseWriter, r *http.Request) {

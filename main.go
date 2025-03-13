@@ -27,6 +27,7 @@ func main() {
 	http.HandleFunc("/chats", enableCORS(chatsHandler))
 	http.HandleFunc("/messages", enableCORS(messagesHandler))
 	http.HandleFunc("/ws", enableCORS(handleWebSocket))
+	http.HandleFunc("/user/image", enableCORS(userImageHandler))
 
 	fmt.Println("Server starting on :8080")
 	log.Fatal(http.ListenAndServe("0.0.0.0:8080", nil))
