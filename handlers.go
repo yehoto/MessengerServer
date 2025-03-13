@@ -25,8 +25,8 @@ func registerHandler(w http.ResponseWriter, r *http.Request) {
 	bio := r.FormValue("bio")
 
 	// Обработка файла изображения
-	file, _, err := r.FormFile("image")
 	var imageBytes []byte
+	file, _, err := r.FormFile("image")
 	if err == nil {
 		defer file.Close()
 		imageBytes, err = io.ReadAll(file)
@@ -55,13 +55,21 @@ func registerHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	defer db.Close()
 
+	// Сохраняем пользователя в базе данных
+	var image interface{}
+	if len(imageBytes) > 0 {
+		image = imageBytes
+	} else {
+		image = nil // Сохраняем NULL, если фото нет
+	}
+
 	_, err = db.Exec(
 		"INSERT INTO users (username, password, name, bio, image) VALUES ($1, $2, $3, $4, $5)",
 		username,
 		string(hashedPassword),
 		name,
 		bio,
-		imageBytes,
+		image,
 	)
 
 	if err != nil {
@@ -259,7 +267,7 @@ func userImageHandler(w http.ResponseWriter, r *http.Request) {
 	var imageBytes []byte
 	err = db.QueryRow("SELECT image FROM users WHERE id = $1", userID).Scan(&imageBytes)
 	if err != nil || len(imageBytes) == 0 {
-		w.WriteHeader(http.StatusNoContent)
+		w.WriteHeader(http.StatusNoContent) // Возвращаем 204, если фото нет
 		return
 	}
 
