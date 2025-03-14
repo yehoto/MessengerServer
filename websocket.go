@@ -6,6 +6,7 @@ import (
 	"log"
 	"net/http"
 	"sync"
+	"time"
 
 	"github.com/gorilla/websocket"
 )
@@ -60,22 +61,27 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 			defer db.Close()
 
 			// Сохраняем сообщение в базе данных
-			_, err = db.Exec(
-				"INSERT INTO messages (chat_id, user_id, content) VALUES ($1, $2, $3)",
+			var messageID int
+			err = db.QueryRow(
+				"INSERT INTO messages (chat_id, user_id, content) VALUES ($1, $2, $3) RETURNING id",
 				msgData.ChatID,
 				msgData.UserID,
 				msgData.Text,
-			)
+			).Scan(&messageID)
 			if err != nil {
 				log.Println("Ошибка при сохранении сообщения:", err)
 			}
 
 			// Добавляем isMe в сообщение
 			msgDataMap := map[string]interface{}{
-				"chat_id": msgData.ChatID,
-				"user_id": msgData.UserID,
-				"text":    msgData.Text,
-				"isMe":    false, // По умолчанию false, так как это сообщение от другого пользователя
+				"id":           messageID,
+				"chat_id":      msgData.ChatID,
+				"user_id":      msgData.UserID,
+				"text":         msgData.Text,
+				"created_at":   time.Now().Format(time.RFC3339),
+				"delivered_at": nil,   // Пока не доставлено
+				"read_at":      nil,   // Пока не прочитано
+				"isMe":         false, // По умолчанию false, так как это сообщение от другого пользователя
 			}
 
 			// Пересылаем сообщение только клиентам в том же чате

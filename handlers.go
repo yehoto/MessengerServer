@@ -534,3 +534,51 @@ func getReactionsHandler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Failed to encode response", http.StatusInternalServerError)
 	}
 }
+
+func markMessageDelivered(w http.ResponseWriter, r *http.Request) {
+	messageID := r.URL.Query().Get("message_id")
+	if messageID == "" {
+		http.Error(w, "Message ID is required", http.StatusBadRequest)
+		return
+	}
+
+	db, err := connectDB()
+	if err != nil {
+		http.Error(w, "Database error", http.StatusInternalServerError)
+		return
+	}
+	defer db.Close()
+
+	_, err = db.Exec("UPDATE messages SET delivered_at = NOW() WHERE id = $1", messageID)
+	if err != nil {
+		http.Error(w, "Failed to mark message as delivered", http.StatusInternalServerError)
+		return
+	}
+
+	w.WriteHeader(http.StatusOK)
+	w.Write([]byte("Message marked as delivered"))
+}
+
+func markMessageRead(w http.ResponseWriter, r *http.Request) {
+	messageID := r.URL.Query().Get("message_id")
+	if messageID == "" {
+		http.Error(w, "Message ID is required", http.StatusBadRequest)
+		return
+	}
+
+	db, err := connectDB()
+	if err != nil {
+		http.Error(w, "Database error", http.StatusInternalServerError)
+		return
+	}
+	defer db.Close()
+
+	_, err = db.Exec("UPDATE messages SET read_at = NOW() WHERE id = $1", messageID)
+	if err != nil {
+		http.Error(w, "Failed to mark message as read", http.StatusInternalServerError)
+		return
+	}
+
+	w.WriteHeader(http.StatusOK)
+	w.Write([]byte("Message marked as read"))
+}
