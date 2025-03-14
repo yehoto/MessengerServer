@@ -28,6 +28,9 @@ func main() {
 	http.HandleFunc("/messages", enableCORS(messagesHandler))
 	http.HandleFunc("/ws", enableCORS(handleWebSocket))
 	http.HandleFunc("/user/image", enableCORS(userImageHandler))
+	http.HandleFunc("/add-reaction", enableCORS(addReactionHandler))
+	http.HandleFunc("/get-reactions", enableCORS(getReactionsHandler))
+	http.HandleFunc("/uploadFile", enableCORS(uploadFileHandler))
 
 	fmt.Println("Server starting on :8080")
 	log.Fatal(http.ListenAndServe("0.0.0.0:8080", nil))

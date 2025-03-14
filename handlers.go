@@ -392,3 +392,145 @@ func messagesHandler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(messages)
 }
+
+func addReactionHandler(w http.ResponseWriter, r *http.Request) {
+	var data struct {
+		MessageID int    `json:"message_id"`
+		UserID    int    `json:"user_id"`
+		Reaction  string `json:"reaction"`
+	}
+
+	if err := json.NewDecoder(r.Body).Decode(&data); err != nil {
+		http.Error(w, "Invalid request body", http.StatusBadRequest)
+		return
+	}
+
+	db, err := connectDB()
+	if err != nil {
+		http.Error(w, "Database error", http.StatusInternalServerError)
+		return
+	}
+	defer db.Close()
+
+	_, err = db.Exec(
+		"INSERT INTO message_reactions (message_id, user_id, reaction) VALUES ($1, $2, $3) ON CONFLICT (message_id, user_id) DO UPDATE SET reaction = $3",
+		data.MessageID,
+		data.UserID,
+		data.Reaction,
+	)
+	if err != nil {
+		http.Error(w, "Failed to add reaction", http.StatusInternalServerError)
+		return
+	}
+
+	// Отправляем реакцию всем подключенным клиентам
+	reactionMessage := map[string]interface{}{
+		"type":       "reaction",
+		"message_id": data.MessageID,
+		"user_id":    data.UserID,
+		"reaction":   data.Reaction,
+	}
+
+	clientsMu.Lock()
+	for client := range clients {
+		err := client.WriteJSON(reactionMessage)
+		if err != nil {
+			log.Println("Ошибка при отправке реакции:", err)
+			client.Close()
+			delete(clients, client)
+		}
+	}
+	clientsMu.Unlock()
+
+	w.WriteHeader(http.StatusOK)
+	w.Write([]byte("Reaction added successfully"))
+}
+
+func uploadFileHandler(w http.ResponseWriter, r *http.Request) {
+	r.ParseMultipartForm(10 << 20) // 10 MB
+
+	file, handler, err := r.FormFile("file")
+	if err != nil {
+		http.Error(w, "Unable to retrieve file", http.StatusBadRequest)
+		return
+	}
+	defer file.Close()
+
+	fileBytes, err := io.ReadAll(file)
+	if err != nil {
+		http.Error(w, "Unable to read file", http.StatusInternalServerError)
+		return
+	}
+
+	messageID := r.FormValue("message_id")
+	if messageID == "" {
+		http.Error(w, "Message ID is required", http.StatusBadRequest)
+		return
+	}
+
+	db, err := connectDB()
+	if err != nil {
+		http.Error(w, "Database error", http.StatusInternalServerError)
+		return
+	}
+	defer db.Close()
+
+	_, err = db.Exec(
+		"INSERT INTO message_files (message_id, file_name, file_data) VALUES ($1, $2, $3)",
+		messageID,
+		handler.Filename,
+		fileBytes,
+	)
+	if err != nil {
+		http.Error(w, "Failed to upload file", http.StatusInternalServerError)
+		return
+	}
+
+	w.WriteHeader(http.StatusOK)
+	w.Write([]byte("File uploaded successfully"))
+}
+func getReactionsHandler(w http.ResponseWriter, r *http.Request) {
+	messageID := r.URL.Query().Get("message_id")
+	if messageID == "" {
+		http.Error(w, "Message ID is required", http.StatusBadRequest)
+		return
+	}
+
+	db, err := connectDB()
+	if err != nil {
+		log.Println("Database connection error:", err)
+		http.Error(w, "Database error", http.StatusInternalServerError)
+		return
+	}
+	defer db.Close()
+
+	rows, err := db.Query("SELECT user_id, reaction FROM message_reactions WHERE message_id = $1", messageID)
+	if err != nil {
+		log.Println("Query error:", err)
+		http.Error(w, "Query error", http.StatusInternalServerError)
+		return
+	}
+	defer rows.Close()
+
+	var reactions []map[string]interface{}
+	for rows.Next() {
+		var userID int
+		var reaction string
+		if err := rows.Scan(&userID, &reaction); err != nil {
+			log.Println("Row scan error:", err)
+			continue
+		}
+		reactions = append(reactions, map[string]interface{}{"user_id": userID, "reaction": reaction})
+	}
+
+	// Если реакций нет, возвращаем пустой список
+	if reactions == nil {
+		reactions = []map[string]interface{}{}
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	if err := json.NewEncoder(w).Encode(reactions); err != nil {
+		log.Println("JSON encoding error:", err)
+		http.Error(w, "Failed to encode response", http.StatusInternalServerError)
+	}
+}
