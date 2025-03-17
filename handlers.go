@@ -386,7 +386,7 @@ func messagesHandler(w http.ResponseWriter, r *http.Request) {
 			"is_system":  isSystem,
 			"isMe":       isMe, // Добавляем isMe
 		})
-		log.Println(messages)
+		//log.Println(messages)
 	}
 
 	w.Header().Set("Content-Type", "application/json")
@@ -581,4 +581,58 @@ func markMessageRead(w http.ResponseWriter, r *http.Request) {
 
 	w.WriteHeader(http.StatusOK)
 	w.Write([]byte("Message marked as read"))
+}
+
+// userProfileHandler обрабатывает запрос на получение профиля пользователя
+func userProfileHandler(w http.ResponseWriter, r *http.Request) {
+	// Получаем ID пользователя из параметров запроса
+	userID := r.URL.Query().Get("id")
+	if userID == "" {
+		http.Error(w, "User ID is required", http.StatusBadRequest)
+		return
+	}
+
+	db, err := connectDB()
+	if err != nil {
+		http.Error(w, "Database error", http.StatusInternalServerError)
+		return
+	}
+	defer db.Close()
+
+	// Запрашиваем данные пользователя из базы данных
+	var (
+		name             string
+		username         string
+		bio              string
+		imageBytes       []byte
+		registrationDate time.Time
+	)
+
+	err = db.QueryRow(`
+		SELECT name, username, bio, image, created_at 
+		FROM users 
+		WHERE id = $1
+	`, userID).Scan(&name, &username, &bio, &imageBytes, &registrationDate)
+
+	if err != nil {
+		if err == sql.ErrNoRows {
+			http.Error(w, "User not found", http.StatusNotFound)
+		} else {
+			http.Error(w, "Database query error", http.StatusInternalServerError)
+		}
+		return
+	}
+
+	// Формируем JSON-ответ
+	response := map[string]interface{}{
+		"name":             name,
+		"username":         username,
+		"bio":              bio,
+		"image":            imageBytes,                            // Возвращаем бинарные данные изображения
+		"registrationDate": registrationDate.Format("2006-01-02"), // Форматируем дату
+	}
+	log.Printf("Зpppp [%s]", response)
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(response)
 }
