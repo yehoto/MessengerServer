@@ -5,13 +5,15 @@ import (
 	"encoding/json"
 	"io"
 	"strconv"
+	"strings"
 	"time"
 
 	//"database/sql"
 	//"github.com/gorilla/websocket"
-	"golang.org/x/crypto/bcrypt"
 	"log"
 	"net/http"
+
+	"golang.org/x/crypto/bcrypt"
 )
 
 // registerHandler обрабатывает запрос на регистрацию
@@ -635,4 +637,177 @@ func userProfileHandler(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(response)
+}
+
+func createGroupChatHandler(w http.ResponseWriter, r *http.Request) {
+	// Парсим форму (включая файлы)
+	err := r.ParseMultipartForm(10 << 20) // 10 MB
+	if err != nil {
+		http.Error(w, "Unable to parse form", http.StatusBadRequest)
+		return
+	}
+
+	// Получаем данные из формы
+	name := r.FormValue("name")
+	description := r.FormValue("description")
+	createdBy := r.FormValue("created_by")
+	isGroup := r.FormValue("is_group") == "true"
+
+	// Получаем user_ids как строку, разделенную запятыми
+	userIDsStr := r.FormValue("user_ids")
+	log.Println("Received user_ids:", userIDsStr) // Логируем полученные данные
+
+	// Разделяем строку на отдельные значения
+	userIDs := strings.Split(userIDsStr, ",")
+	if len(userIDs) == 0 {
+		http.Error(w, "No user IDs provided", http.StatusBadRequest)
+		return
+	}
+
+	// Обработка изображения (только для группового чата)
+	var imageBytes []byte
+	if isGroup {
+		file, _, err := r.FormFile("image")
+		if err == nil {
+			defer file.Close()
+			imageBytes, err = io.ReadAll(file)
+			if err != nil {
+				http.Error(w, "Error reading image", http.StatusBadRequest)
+				return
+			}
+		}
+	}
+
+	// Подключаемся к базе данных
+	db, err := connectDB()
+	if err != nil {
+		http.Error(w, "Database connection failed", http.StatusInternalServerError)
+		return
+	}
+	defer db.Close()
+
+	// Начинаем транзакцию
+	tx, err := db.Begin()
+	if err != nil {
+		http.Error(w, "Transaction failed to start", http.StatusInternalServerError)
+		return
+	}
+
+	// Создаем запись в таблице chats
+	var chatID int
+	err = tx.QueryRow("INSERT INTO chats (is_group) VALUES ($1) RETURNING id", isGroup).Scan(&chatID)
+	if err != nil {
+		tx.Rollback()
+		http.Error(w, "Failed to create chat: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	// Если это групповой чат, создаем запись в таблице group_chats
+	if isGroup {
+		_, err = tx.Exec(
+			"INSERT INTO group_chats (chat_id, name, description, created_by, image) VALUES ($1, $2, $3, $4, $5)",
+			chatID, name, description, createdBy, imageBytes,
+		)
+		if err != nil {
+			tx.Rollback()
+			http.Error(w, "Failed to create group chat: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+	}
+
+	// Добавляем участников в таблицу participants
+	for _, userID := range userIDs {
+		isAdmin := userID == createdBy // Создатель чата становится администратором
+		_, err = tx.Exec(
+			"INSERT INTO participants (chat_id, user_id, is_admin) VALUES ($1, $2, $3)",
+			chatID, userID, isAdmin,
+		)
+		if err != nil {
+			tx.Rollback()
+			http.Error(w, "Failed to add participant: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+	}
+
+	// Добавляем системное сообщение о создании чата
+	var messageContent string
+	if isGroup {
+		messageContent = "Групповой чат создан"
+	} else {
+		messageContent = "Чат создан"
+	}
+
+	_, err = tx.Exec(
+		"INSERT INTO messages (chat_id, content, is_system) VALUES ($1, $2, true)",
+		chatID, messageContent,
+	)
+	if err != nil {
+		tx.Rollback()
+		http.Error(w, "Failed to create system message: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	// Завершаем транзакцию
+	err = tx.Commit()
+	if err != nil {
+		http.Error(w, "Transaction commit failed: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	// Возвращаем успешный ответ
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"chat_id":  chatID,
+		"is_group": isGroup,
+	})
+}
+
+func allUsersHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "GET" {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	currentUserID := r.URL.Query().Get("current_user_id")
+	if currentUserID == "" {
+		http.Error(w, "Current user ID is required", http.StatusBadRequest)
+		return
+	}
+
+	db, err := connectDB()
+	if err != nil {
+		http.Error(w, "Database error", http.StatusInternalServerError)
+		return
+	}
+	defer db.Close()
+
+	// Запрос всех пользователей, исключая текущего
+	rows, err := db.Query(`
+        SELECT id, username 
+        FROM users 
+        WHERE id != $1
+    `, currentUserID)
+
+	if err != nil {
+		http.Error(w, "Query error: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	defer rows.Close()
+
+	var users []map[string]interface{}
+	for rows.Next() {
+		var id int
+		var username string
+		if err := rows.Scan(&id, &username); err != nil {
+			log.Println("Error scanning user row:", err)
+			continue
+		}
+		users = append(users, map[string]interface{}{"id": id, "username": username})
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	if users == nil {
+		users = []map[string]interface{}{}
+	}
+	json.NewEncoder(w).Encode(users)
 }
