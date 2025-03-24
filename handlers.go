@@ -192,25 +192,41 @@ func getChatsHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	defer db.Close()
 
+	// Исправленный SQL-запрос без комментариев и с правильными JOIN
 	rows, err := db.Query(`
         SELECT 
             c.id AS chat_id,
             c.last_message_at,
             p.unread_count,
             m.content AS last_message,
-            u.name AS partner_name,
-            u.id AS partner_id
+            CASE
+                WHEN c.is_group THEN gc.name
+                ELSE u.username
+            END AS chat_name,
+            CASE
+                WHEN c.is_group THEN NULL
+                ELSE u.id
+            END AS partner_id,
+            c.is_group,
+            gc.image as group_image,
+            u.username as partner_name
         FROM participants p
         JOIN chats c ON p.chat_id = c.id
-        LEFT JOIN messages m ON c.last_message_at = m.created_at
-        JOIN participants p2 ON p2.chat_id = c.id AND p2.user_id != $1
-        JOIN users u ON u.id = p2.user_id
+        LEFT JOIN (
+            SELECT DISTINCT ON (chat_id) chat_id, content 
+            FROM messages 
+            ORDER BY chat_id, created_at DESC
+        ) m ON m.chat_id = c.id
+        LEFT JOIN group_chats gc ON gc.chat_id = c.id AND c.is_group
+        LEFT JOIN participants p2 ON p2.chat_id = c.id AND p2.user_id != $1 AND NOT c.is_group
+        LEFT JOIN users u ON u.id = p2.user_id
         WHERE p.user_id = $1
         ORDER BY c.last_message_at DESC
     `, currentUserID)
 
 	if err != nil {
-		http.Error(w, "Query error: "+err.Error(), http.StatusInternalServerError)
+		log.Printf("Query error: %v", err)
+		http.Error(w, "Database query error", http.StatusInternalServerError)
 		return
 	}
 	defer rows.Close()
@@ -222,38 +238,64 @@ func getChatsHandler(w http.ResponseWriter, r *http.Request) {
 			timestamp   sql.NullTime
 			unreadCount int
 			lastMessage sql.NullString
-			partnerName string
-			partnerID   int
+			chatName    sql.NullString
+			partnerID   sql.NullInt64
+			isGroup     bool
+			groupImage  []byte
+			partnerName sql.NullString
 		)
 
-		// Порядок должен точно соответствовать SELECT
 		if err := rows.Scan(
 			&chatID,
 			&timestamp,
 			&unreadCount,
 			&lastMessage,
-			&partnerName,
+			&chatName,
 			&partnerID,
+			&isGroup,
+			&groupImage,
+			&partnerName,
 		); err != nil {
-			log.Println("Ошибка сканирования строки:", err)
+			log.Printf("Scan error: %v", err)
 			continue
 		}
 
-		chats = append(chats, map[string]interface{}{
-			"id":           chatID,
-			"lastMessage":  lastMessage.String,
-			"unread":       unreadCount,
-			"timestamp":    timestamp.Time,
-			"partner_name": partnerName,
-			"partner_id":   partnerID,
-		})
+		chatData := map[string]interface{}{
+			"id":          chatID,
+			"lastMessage": lastMessage.String,
+			"unread":      unreadCount,
+			"timestamp":   timestamp.Time,
+			"chat_name":   chatName.String,
+			"is_group":    isGroup,
+		}
+
+		if isGroup {
+			if len(groupImage) > 0 {
+				chatData["group_image"] = groupImage
+			}
+		} else {
+			if partnerID.Valid {
+				chatData["partner_id"] = partnerID.Int64
+			}
+			if partnerName.Valid {
+				chatData["partner_name"] = partnerName.String
+			}
+		}
+
+		chats = append(chats, chatData)
+	}
+
+	if err := rows.Err(); err != nil {
+		log.Printf("Rows error: %v", err)
+		http.Error(w, "Error processing results", http.StatusInternalServerError)
+		return
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	if chats == nil {
-		chats = []map[string]interface{}{}
+	if err := json.NewEncoder(w).Encode(chats); err != nil {
+		log.Printf("JSON encode error: %v", err)
+		http.Error(w, "Error encoding response", http.StatusInternalServerError)
 	}
-	json.NewEncoder(w).Encode(chats)
 }
 
 func userImageHandler(w http.ResponseWriter, r *http.Request) {
@@ -633,7 +675,7 @@ func userProfileHandler(w http.ResponseWriter, r *http.Request) {
 		"image":            imageBytes,                            // Возвращаем бинарные данные изображения
 		"registrationDate": registrationDate.Format("2006-01-02"), // Форматируем дату
 	}
-	log.Printf("Зpppp [%s]", response)
+	//log.Printf("Зpppp [%s]", response)
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(response)
@@ -655,10 +697,13 @@ func createGroupChatHandler(w http.ResponseWriter, r *http.Request) {
 
 	// Получаем user_ids как строку, разделенную запятыми
 	userIDsStr := r.FormValue("user_ids")
+
 	log.Println("Received user_ids:", userIDsStr) // Логируем полученные данные
 
 	// Разделяем строку на отдельные значения
 	userIDs := strings.Split(userIDsStr, ",")
+	// Добавляем создателя в список участников
+	userIDs = append(userIDs, createdBy)
 	if len(userIDs) == 0 {
 		http.Error(w, "No user IDs provided", http.StatusBadRequest)
 		return
