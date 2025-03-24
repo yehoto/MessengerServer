@@ -372,7 +372,7 @@ func messagesHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	chatID := r.URL.Query().Get("chat_id")
-	currentUserID := r.URL.Query().Get("user_id") // Добавляем ID текущего пользователя
+	currentUserID := r.URL.Query().Get("user_id")
 	if chatID == "" || currentUserID == "" {
 		http.Error(w, "Chat ID and User ID are required", http.StatusBadRequest)
 		return
@@ -385,12 +385,30 @@ func messagesHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	defer db.Close()
 
+	// Проверяем, является ли чат групповым
+	var isGroup bool
+	err = db.QueryRow("SELECT is_group FROM chats WHERE id = $1", chatID).Scan(&isGroup)
+	if err != nil {
+		http.Error(w, "Failed to get chat type", http.StatusInternalServerError)
+		return
+	}
+
+	// Улучшенный запрос, который работает для обоих типов чатов
 	rows, err := db.Query(`
-        SELECT id, content, created_at, user_id, is_system 
-        FROM messages 
-        WHERE chat_id = $1 
-        ORDER BY created_at ASC
+        SELECT 
+            m.id,
+            m.content,
+            m.created_at,
+            m.user_id,
+            m.is_system,
+            u.username as sender_name,
+            u.image as sender_image
+        FROM messages m
+        LEFT JOIN users u ON m.user_id = u.id
+        WHERE m.chat_id = $1
+        ORDER BY m.created_at ASC
     `, chatID)
+
 	if err != nil {
 		http.Error(w, "Query error: "+err.Error(), http.StatusInternalServerError)
 		return
@@ -404,36 +422,39 @@ func messagesHandler(w http.ResponseWriter, r *http.Request) {
 		var createdAt time.Time
 		var userID sql.NullInt64
 		var isSystem bool
+		var senderName sql.NullString
+		var senderImage []byte
 
-		if err := rows.Scan(&id, &content, &createdAt, &userID, &isSystem); err != nil {
+		if err := rows.Scan(&id, &content, &createdAt, &userID, &isSystem, &senderName, &senderImage); err != nil {
 			log.Println("Error scanning message row:", err)
 			continue
 		}
 
-		// Вычисляем isMe
-		//isMe := userID.Int64 == currentUserID
-		// Вычисляем isMe
-		userIDInt64 := userID.Int64
-		currentUserIDInt64, err := strconv.ParseInt(currentUserID, 10, 64)
-		if err != nil {
-			log.Println("Error converting currentUserID to int64:", err)
-			continue // or handle error differently, e.g., set isMe to false
-		}
+		currentUserIDInt, _ := strconv.ParseInt(currentUserID, 10, 64)
+		isMe := userID.Int64 == currentUserIDInt
 
-		isMe := userIDInt64 == currentUserIDInt64
-
-		messages = append(messages, map[string]interface{}{
+		messageData := map[string]interface{}{
 			"id":         id,
 			"text":       content,
 			"created_at": createdAt,
 			"user_id":    userID.Int64,
 			"is_system":  isSystem,
-			"isMe":       isMe, // Добавляем isMe
-		})
-		//log.Println(messages)
+			"isMe":       isMe,
+			"is_group":   isGroup, // Добавляем информацию о типе чата
+		}
+
+		if senderName.Valid {
+			messageData["sender_name"] = senderName.String
+		}
+		if len(senderImage) > 0 {
+			messageData["sender_image"] = senderImage
+		}
+
+		messages = append(messages, messageData)
 	}
 
 	w.Header().Set("Content-Type", "application/json")
+	log.Print(messages)
 	json.NewEncoder(w).Encode(messages)
 }
 
