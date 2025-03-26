@@ -152,14 +152,23 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 			log.Printf("Ошибка сохранения [%d]: %v", userID, err)
 		}
 
+		// После вставки сообщения в БД
+		var senderName string
+		err = db.QueryRow("SELECT username FROM users WHERE id = $1", msgData.UserID).Scan(&senderName)
+		if err != nil {
+			log.Printf("Ошибка получения имени: %v", err)
+			senderName = "Unknown" // Запасной вариант
+		}
+
 		// Подготовка сообщения для рассылки
 		msgDataMap := map[string]interface{}{
-			"id":         messageID,
-			"chat_id":    msgData.ChatID,
-			"user_id":    msgData.UserID,
-			"text":       msgData.Text,
-			"created_at": time.Now().Format(time.RFC3339),
-			"isMe":       false,
+			"id":          messageID,
+			"chat_id":     msgData.ChatID,
+			"user_id":     msgData.UserID,
+			"text":        msgData.Text,
+			"created_at":  time.Now().Format(time.RFC3339),
+			"isMe":        false,
+			"sender_name": senderName,
 		}
 
 		// Рассылка сообщения
