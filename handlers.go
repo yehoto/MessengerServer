@@ -201,7 +201,7 @@ func getChatsHandler(w http.ResponseWriter, r *http.Request) {
             m.content AS last_message,
             CASE
                 WHEN c.is_group THEN gc.name
-                ELSE u.username
+                ELSE u.name
             END AS chat_name,
             CASE
                 WHEN c.is_group THEN NULL
@@ -209,7 +209,7 @@ func getChatsHandler(w http.ResponseWriter, r *http.Request) {
             END AS partner_id,
             c.is_group,
             gc.image as group_image,
-            u.username as partner_name
+            u.name as partner_name
         FROM participants p
         JOIN chats c ON p.chat_id = c.id
         LEFT JOIN (
