@@ -127,7 +127,6 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 			log.Printf("Ошибка подключения к БД в WebSocket: %v", err)
 			continue
 		}
-		defer db.Close()
 
 		var parentMessageID sql.NullInt64
 		if msgData.ParentMessageID != nil {
@@ -152,9 +151,9 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		).Scan(&messageID)
 		if err != nil {
 			log.Printf("Ошибка сохранения сообщения в БД: %v", err)
+			db.Close()
 			continue
 		}
-		log.Printf("Сообщение сохранено с ID: %d", messageID)
 
 		var senderName string
 		err = db.QueryRow("SELECT username FROM users WHERE id = $1", msgData.UserID).Scan(&senderName)
@@ -186,18 +185,43 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 
+		// Получаем список участников чата
+		rows, err := db.Query("SELECT user_id FROM participants WHERE chat_id = $1", msgData.ChatID)
+		if err != nil {
+			log.Printf("Ошибка получения участников чата: %v", err)
+			db.Close()
+			continue
+		}
+		defer rows.Close()
+
+		var participantIDs []int
+		for rows.Next() {
+			var participantID int
+			if err := rows.Scan(&participantID); err != nil {
+				log.Printf("Ошибка сканирования participant_id: %v", err)
+				continue
+			}
+			participantIDs = append(participantIDs, participantID)
+		}
+		db.Close()
+
+		// Рассылка всем участникам чата
 		clientsMu.Lock()
-		log.Printf("Рассылка сообщения клиентам в чате %d", msgData.ChatID)
+		log.Printf("Рассылка сообщения клиентам в чате %d (участники: %v)", msgData.ChatID, participantIDs)
 		for client, info := range clients {
-			if info.chatID == msgData.ChatID {
-				isMe := (client == conn)
-				msgDataMap["isMe"] = isMe
-				messageWithIsMe, _ := json.Marshal(msgDataMap)
-				err := client.WriteMessage(websocket.TextMessage, messageWithIsMe)
-				if err != nil {
-					log.Printf("Ошибка отправки сообщения клиенту: %v", err)
-					client.Close()
-					delete(clients, client)
+			// Проверяем, является ли клиент участником чата
+			for _, pid := range participantIDs {
+				if info.userID == pid {
+					isMe := (client == conn)
+					msgDataMap["isMe"] = isMe
+					messageWithIsMe, _ := json.Marshal(msgDataMap)
+					err := client.WriteMessage(websocket.TextMessage, messageWithIsMe)
+					if err != nil {
+						log.Printf("Ошибка отправки сообщения клиенту (user_id=%d): %v", info.userID, err)
+						client.Close()
+						delete(clients, client)
+					}
+					break // Прерываем внутренний цикл, так как сообщение уже отправлено этому клиенту
 				}
 			}
 		}
