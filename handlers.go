@@ -1085,76 +1085,6 @@ func allUsersHandler(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(users)
 }
 
-// func forwardMessage(w http.ResponseWriter, r *http.Request) {
-// 	log.Printf("Request body: %v", data)
-
-// 	var data struct {
-// 		ChatID         int    `json:"chat_id"`
-// 		UserID         int    `json:"user_id"`
-// 		Text           string `json:"text"`
-// 		OriginalSender int    `json:"original_sender_id"`
-// 		OriginalChat   int    `json:"original_chat_id"`
-// 	}
-// 	if err := json.NewDecoder(r.Body).Decode(&data); err != nil {
-// 		http.Error(w, "Invalid request body", http.StatusBadRequest)
-// 		return
-// 	}
-
-// 	if data.ChatID == 0 || data.UserID == 0 || data.OriginalSender == 0 || data.OriginalChat == 0 {
-// 		http.Error(w, "Missing required fields", http.StatusBadRequest)
-// 		return
-// 	}
-
-// 	db, err := connectDB()
-// 	if err != nil {
-// 		http.Error(w, "Database error", http.StatusInternalServerError)
-// 		return
-// 	}
-// 	defer db.Close()
-
-// 	var messageID int
-// 	err = db.QueryRow(`
-//         INSERT INTO messages (chat_id, user_id, content, is_forwarded, original_sender_id, original_chat_id)
-//         VALUES ($1, $2, $3, true, $4, $5) RETURNING id
-//     `, data.ChatID, data.UserID, data.Text, data.OriginalSender, data.OriginalChat).Scan(&messageID)
-// 	if err != nil {
-// 		http.Error(w, "Failed to insert message", http.StatusInternalServerError)
-// 		return
-// 	}
-
-// 	// После вставки сообщения
-// var originalSenderName string
-// err = db.QueryRow("SELECT username FROM users WHERE id = $1", data.OriginalSender).Scan(&originalSenderName)
-// if err != nil {
-//     log.Printf("Ошибка получения имени отправителя: %v", err)
-//     originalSenderName = "Unknown"
-// }
-// message["original_sender_name"] = originalSenderName
-
-// 	// Подготовка сообщения для рассылки
-// 	message := map[string]interface{}{
-// 		"id":                 messageID,
-// 		"chat_id":            data.ChatID,
-// 		"user_id":            data.UserID,
-// 		"text":               data.Text,
-// 		"created_at":         time.Now().Format(time.RFC3339),
-// 		"is_forwarded":       true,
-// 		"original_sender_id": data.OriginalSender,
-// 		"original_chat_id":   data.OriginalChat,
-// 	}
-
-// 	// Рассылка всем клиентам в целевом чате
-// 	clientsMu.Lock()
-// 	for client, info := range clients {
-// 		if info.chatID == data.ChatID {
-// 			client.WriteJSON(message)
-// 		}
-// 	}
-// 	clientsMu.Unlock()
-
-//		w.WriteHeader(http.StatusOK)
-//		w.Write([]byte("Message forwarded successfully"))
-//	}
 func forwardMessage(w http.ResponseWriter, r *http.Request) {
 	var data struct {
 		ChatID         int    `json:"chat_id"`
@@ -1252,4 +1182,34 @@ func forwardMessage(w http.ResponseWriter, r *http.Request) {
 	log.Printf("Пересылка сообщения успешно завершена")
 	w.WriteHeader(http.StatusOK)
 	w.Write([]byte("Message forwarded successfully"))
+}
+
+func resetUnreadHandler(w http.ResponseWriter, r *http.Request) {
+	var data struct {
+		ChatID int `json:"chat_id"`
+		UserID int `json:"user_id"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&data); err != nil {
+		http.Error(w, "Invalid request body", http.StatusBadRequest)
+		return
+	}
+
+	db, err := connectDB()
+	if err != nil {
+		http.Error(w, "Database error", http.StatusInternalServerError)
+		return
+	}
+	defer db.Close()
+
+	_, err = db.Exec(
+		"UPDATE participants SET unread_count = 0 WHERE chat_id = $1 AND user_id = $2",
+		data.ChatID, data.UserID,
+	)
+	if err != nil {
+		http.Error(w, "Failed to reset unread count", http.StatusInternalServerError)
+		return
+	}
+
+	w.WriteHeader(http.StatusOK)
+	w.Write([]byte("Unread count reset"))
 }
