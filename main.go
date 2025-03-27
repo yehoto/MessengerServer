@@ -37,6 +37,7 @@ func main() {
 	http.HandleFunc("/all-users", enableCORS(allUsersHandler))
 	http.HandleFunc("/forward-message", enableCORS(forwardMessage))
 	http.HandleFunc("/reset_unread", resetUnreadHandler)
+	http.HandleFunc("/group_participants_count", getGroupParticipantsCountHandler)
 
 	fmt.Println("Server starting on :8080")
 	log.Fatal(http.ListenAndServe("0.0.0.0:8080", nil))

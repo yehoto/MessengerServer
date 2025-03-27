@@ -1213,3 +1213,53 @@ func resetUnreadHandler(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 	w.Write([]byte("Unread count reset"))
 }
+
+// Обработчик для получения количества участников группового чата
+func getGroupParticipantsCountHandler(w http.ResponseWriter, r *http.Request) {
+	chatIDStr := r.URL.Query().Get("chat_id")
+	chatID, err := strconv.Atoi(chatIDStr)
+	if err != nil {
+		log.Printf("Невалидный chat_id в запросе: %s", chatIDStr)
+		http.Error(w, "Invalid chat_id", http.StatusBadRequest)
+		return
+	}
+
+	db, err := connectDB()
+	if err != nil {
+		log.Printf("Ошибка подключения к БД: %v", err)
+		http.Error(w, "Database error", http.StatusInternalServerError)
+		return
+	}
+	defer db.Close()
+
+	// Проверяем, что чат групповой
+	var isGroup bool
+	err = db.QueryRow("SELECT is_group FROM chats WHERE id = $1", chatID).Scan(&isGroup)
+	if err != nil {
+		log.Printf("Ошибка проверки типа чата %d: %v", chatID, err)
+		http.Error(w, "Chat not found", http.StatusNotFound)
+		return
+	}
+	if !isGroup {
+		http.Error(w, "Not a group chat", http.StatusBadRequest)
+		return
+	}
+
+	// Получаем общее количество участников
+	var participantsCount int
+	err = db.QueryRow("SELECT COUNT(*) FROM participants WHERE chat_id = $1", chatID).Scan(&participantsCount)
+	if err != nil {
+		log.Printf("Ошибка подсчета участников чата %d: %v", chatID, err)
+		http.Error(w, "Failed to count participants", http.StatusInternalServerError)
+		return
+	}
+
+	// Формируем ответ
+	response := map[string]interface{}{
+		"chat_id":            chatID,
+		"participants_count": participantsCount,
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(response)
+}
