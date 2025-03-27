@@ -364,7 +364,6 @@ func createChatHandler(w http.ResponseWriter, r *http.Request) {
 	tx.Commit()
 	json.NewEncoder(w).Encode(map[string]int{"chatId": chatID})
 }
-
 func messagesHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != "GET" {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
@@ -373,43 +372,47 @@ func messagesHandler(w http.ResponseWriter, r *http.Request) {
 
 	chatID := r.URL.Query().Get("chat_id")
 	currentUserID := r.URL.Query().Get("user_id")
+	log.Printf("Запрос сообщений: chat_id=%s, user_id=%s", chatID, currentUserID)
+
 	if chatID == "" || currentUserID == "" {
+		log.Printf("Ошибка: отсутствуют chat_id или user_id")
 		http.Error(w, "Chat ID and User ID are required", http.StatusBadRequest)
 		return
 	}
 
 	db, err := connectDB()
 	if err != nil {
+		log.Printf("Ошибка подключения к БД: %v", err)
 		http.Error(w, "Database error", http.StatusInternalServerError)
 		return
 	}
 	defer db.Close()
 
-	// Проверяем, является ли чат групповым
 	var isGroup bool
 	err = db.QueryRow("SELECT is_group FROM chats WHERE id = $1", chatID).Scan(&isGroup)
 	if err != nil {
+		log.Printf("Ошибка получения типа чата: %v", err)
 		http.Error(w, "Failed to get chat type", http.StatusInternalServerError)
 		return
 	}
+	log.Printf("Чат групповой: %t", isGroup)
 
-	// Улучшенный запрос, который работает для обоих типов чатов
 	rows, err := db.Query(`
-        SELECT 
-            m.id,
-            m.content,
-            m.created_at,
-            m.user_id,
-            m.is_system,
-            u.username as sender_name,
-            u.image as sender_image
-        FROM messages m
-        LEFT JOIN users u ON m.user_id = u.id
-        WHERE m.chat_id = $1
-        ORDER BY m.created_at ASC
-    `, chatID)
-
+	  SELECT 
+		  m.id, m.content, m.created_at, m.user_id, m.is_system,
+		  m.parent_message_id, m.is_forwarded, m.original_sender_id, m.original_chat_id,
+		  u.username AS sender_name, pm.content AS parent_content, pu.username AS parent_sender,
+		  ou.username AS original_sender_name
+	  FROM messages m
+	  LEFT JOIN users u ON m.user_id = u.id
+	  LEFT JOIN messages pm ON m.parent_message_id = pm.id
+	  LEFT JOIN users pu ON pm.user_id = pu.id
+	  LEFT JOIN users ou ON m.original_sender_id = ou.id
+	  WHERE m.chat_id = $1
+	  ORDER BY m.created_at ASC
+	`, chatID)
 	if err != nil {
+		log.Printf("Ошибка выполнения запроса к БД: %v", err)
 		http.Error(w, "Query error: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
@@ -417,16 +420,28 @@ func messagesHandler(w http.ResponseWriter, r *http.Request) {
 
 	var messages []map[string]interface{}
 	for rows.Next() {
-		var id int
-		var content string
-		var createdAt time.Time
-		var userID sql.NullInt64
-		var isSystem bool
-		var senderName sql.NullString
-		var senderImage []byte
+		var (
+			id                 int
+			content            string
+			createdAt          time.Time
+			userID             sql.NullInt64
+			isSystem           bool
+			parentMessageID    sql.NullInt64
+			isForwarded        bool
+			originalSender     sql.NullInt64
+			originalChat       sql.NullInt64
+			senderName         sql.NullString
+			parentContent      sql.NullString
+			parentSender       sql.NullString
+			originalSenderName sql.NullString
+		)
 
-		if err := rows.Scan(&id, &content, &createdAt, &userID, &isSystem, &senderName, &senderImage); err != nil {
-			log.Println("Error scanning message row:", err)
+		if err := rows.Scan(
+			&id, &content, &createdAt, &userID, &isSystem,
+			&parentMessageID, &isForwarded, &originalSender, &originalChat,
+			&senderName, &parentContent, &parentSender, &originalSenderName,
+		); err != nil {
+			log.Printf("Ошибка чтения строки результата: %v", err)
 			continue
 		}
 
@@ -434,29 +449,221 @@ func messagesHandler(w http.ResponseWriter, r *http.Request) {
 		isMe := userID.Int64 == currentUserIDInt
 
 		messageData := map[string]interface{}{
-			"id":         id,
-			"text":       content,
-			"created_at": createdAt,
-			"user_id":    userID.Int64,
-			"is_system":  isSystem,
-			"isMe":       isMe,
-			"is_group":   isGroup, // Добавляем информацию о типе чата
+			"id":                   id,
+			"text":                 content,
+			"created_at":           createdAt,
+			"user_id":              userID.Int64,
+			"is_system":            isSystem,
+			"isMe":                 isMe,
+			"is_group":             isGroup,
+			"parent_message_id":    parentMessageID.Int64,
+			"parent_content":       parentContent.String,
+			"parent_sender":        parentSender.String,
+			"is_forwarded":         isForwarded,
+			"original_sender_id":   originalSender.Int64,
+			"original_chat_id":     originalChat.Int64,
+			"original_sender_name": originalSenderName.String,
 		}
-
 		if senderName.Valid {
 			messageData["sender_name"] = senderName.String
 		}
-		if len(senderImage) > 0 {
-			messageData["sender_image"] = senderImage
-		}
-
 		messages = append(messages, messageData)
 	}
+	log.Printf("Загружено сообщений: %d", len(messages))
 
 	w.Header().Set("Content-Type", "application/json")
-	log.Print(messages)
 	json.NewEncoder(w).Encode(messages)
 }
+
+// func messagesHandler(w http.ResponseWriter, r *http.Request) {
+// 	if r.Method != "GET" {
+// 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+// 		return
+// 	}
+
+// 	chatID := r.URL.Query().Get("chat_id")
+// 	currentUserID := r.URL.Query().Get("user_id")
+// 	if chatID == "" || currentUserID == "" {
+// 		http.Error(w, "Chat ID and User ID are required", http.StatusBadRequest)
+// 		return
+// 	}
+
+// 	db, err := connectDB()
+// 	if err != nil {
+// 		http.Error(w, "Database error", http.StatusInternalServerError)
+// 		return
+// 	}
+// 	defer db.Close()
+
+// 	// Проверяем, является ли чат групповым
+// 	var isGroup bool
+// 	err = db.QueryRow("SELECT is_group FROM chats WHERE id = $1", chatID).Scan(&isGroup)
+// 	if err != nil {
+// 		http.Error(w, "Failed to get chat type", http.StatusInternalServerError)
+// 		return
+// 	}
+
+// 	// Улучшенный запрос, который работает для обоих типов чатов
+// 	// rows, err := db.Query(`
+// 	//     SELECT
+// 	//         m.id,
+// 	//         m.content,
+// 	//         m.created_at,
+// 	//         m.user_id,
+// 	//         m.is_system,
+// 	//         m.parent_message_id,
+// 	//         m.is_forwarded,
+// 	//         m.original_sender_id,
+// 	//         m.original_chat_id,
+// 	//         u.username as sender_name,
+// 	//         pm.content as parent_content,
+// 	//         pu.username as parent_sender
+// 	//     FROM messages m
+// 	//     LEFT JOIN users u ON m.user_id = u.id
+// 	//     LEFT JOIN messages pm ON m.parent_message_id = pm.id
+// 	//     LEFT JOIN users pu ON pm.user_id = pu.id
+// 	//     WHERE m.chat_id = $1
+// 	//     ORDER BY m.created_at ASC
+// 	// `, chatID)
+// 	// Улучшенный запрос, который работает для обоих типов чатов
+// 	rows, err := db.Query(`
+//         SELECT
+//             m.id,
+//             m.content,
+//             m.created_at,
+//             m.user_id,
+//             m.is_system,
+//             m.parent_message_id,
+//             m.is_forwarded,
+//             m.original_sender_id,
+//             m.original_chat_id,
+//             u.username AS sender_name,
+//             pm.content AS parent_content,
+//             pu.username AS parent_sender,
+//             ou.username AS original_sender_name
+//         FROM messages m
+//         LEFT JOIN users u ON m.user_id = u.id
+//         LEFT JOIN messages pm ON m.parent_message_id = pm.id
+//         LEFT JOIN users pu ON pm.user_id = pu.id
+//         LEFT JOIN users ou ON m.original_sender_id = ou.id
+//         WHERE m.chat_id = $1
+//         ORDER BY m.created_at ASC
+//     `, chatID)
+
+// 	if err != nil {
+// 		http.Error(w, "Query error: "+err.Error(), http.StatusInternalServerError)
+// 		return
+// 	}
+// 	defer rows.Close()
+
+// 	var messages []map[string]interface{}
+// 	for rows.Next() {
+// 		var (
+// 			id              int
+// 			content         string
+// 			createdAt       time.Time
+// 			userID          sql.NullInt64
+// 			isSystem        bool
+// 			parentMessageID sql.NullInt64
+// 			isForwarded     bool
+// 			originalSender  sql.NullInt64
+// 			originalChat    sql.NullInt64
+// 			senderName      sql.NullString
+// 			parentContent   sql.NullString
+// 			parentSender    sql.NullString
+// 		)
+
+// 		// if err := rows.Scan(&id, &content, &createdAt, &userID, &isSystem, &senderName, &senderImage); err != nil {
+// 		// 	log.Println("Error scanning message row:", err)
+// 		// 	continue
+// 		// }
+// 		if err := rows.Scan(
+// 			&id,
+// 			&content,
+// 			&createdAt,
+// 			&userID,
+// 			&isSystem,
+// 			&parentMessageID,
+// 			&isForwarded,
+// 			&originalSender,
+// 			&originalChat,
+// 			&senderName,
+// 			&parentContent,
+// 			&parentSender,
+// 		); err != nil {
+// 			log.Println("Error scanning message row:", err)
+// 			continue
+// 		}
+
+// 		currentUserIDInt, _ := strconv.ParseInt(currentUserID, 10, 64)
+// 		isMe := userID.Int64 == currentUserIDInt
+
+// 		// messageData := map[string]interface{}{
+// 		// 	"id":         id,
+// 		// 	"text":       content,
+// 		// 	"created_at": createdAt,
+// 		// 	"user_id":    userID.Int64,
+// 		// 	"is_system":  isSystem,
+// 		// 	"isMe":       isMe,
+// 		// 	"is_group":   isGroup, // Добавляем информацию о типе чата
+// 		// 	"parent_message": parentContent,
+// 		//     "parent_sender": parentSender,
+// 		//     "is_forwarded":   isForwarded,
+// 		//     "original_sender": originalSenderID,
+// 		//     "original_chat":  originalChatID,
+// 		// }
+// 		// messageData := map[string]interface{}{
+// 		// 	"id":              id,
+// 		// 	"text":            content,
+// 		// 	"created_at":      createdAt,
+// 		// 	"user_id":         userID.Int64,
+// 		// 	"is_system":       isSystem,
+// 		// 	"isMe":            isMe,
+// 		// 	"is_group":        isGroup,
+// 		// 	"parent_message":  parentContent.String,
+// 		// 	"parent_sender":   parentSender.String,
+// 		// 	"is_forwarded":    isForwarded,
+// 		// 	"original_sender": originalSender.Int64,
+// 		// 	"original_chat":   originalChat.Int64,
+// 		// }
+
+// 		// if senderName.Valid {
+// 		// 	messageData["sender_name"] = senderName.String
+// 		// }
+// 		// if len(senderImage) > 0 {
+// 		// 	messageData["sender_image"] = senderImage
+// 		// }
+// 		var originalSenderName sql.NullString
+//     if err := rows.Scan(&id, &content, &createdAt, &userID, &isSystem, &parentMessageID, &isForwarded, &originalSender, &originalChat, &senderName, &parentContent, &parentSender, &originalSenderName); err != nil {
+//         log.Println("Error scanning message row:", err)
+//         continue
+//     }
+//     messageData := map[string]interface{
+//         "id": id,
+//         "text": content,
+//         "created_at": createdAt,
+//         "user_id": userID.Int64,
+//         "is_system": isSystem,
+//         "isMe": isMe,
+//         "is_group": isGroup,
+//         "parent_message": parentContent.String,
+//         "parent_sender": parentSender.String,
+//         "is_forwarded": isForwarded,
+//         "original_sender": originalSender.Int64,
+//         "original_chat": originalChat.Int64,
+//         "original_sender_name": originalSenderName.String,
+//     }
+//     if senderName.Valid {
+//         messageData["sender_name"] = senderName.String
+//     }
+
+// 		messages = append(messages, messageData)
+// 	}
+
+// 	w.Header().Set("Content-Type", "application/json")
+// 	log.Print(messages)
+// 	json.NewEncoder(w).Encode(messages)
+// }
 
 func addReactionHandler(w http.ResponseWriter, r *http.Request) {
 	var data struct {
@@ -876,4 +1083,173 @@ func allUsersHandler(w http.ResponseWriter, r *http.Request) {
 		users = []map[string]interface{}{}
 	}
 	json.NewEncoder(w).Encode(users)
+}
+
+// func forwardMessage(w http.ResponseWriter, r *http.Request) {
+// 	log.Printf("Request body: %v", data)
+
+// 	var data struct {
+// 		ChatID         int    `json:"chat_id"`
+// 		UserID         int    `json:"user_id"`
+// 		Text           string `json:"text"`
+// 		OriginalSender int    `json:"original_sender_id"`
+// 		OriginalChat   int    `json:"original_chat_id"`
+// 	}
+// 	if err := json.NewDecoder(r.Body).Decode(&data); err != nil {
+// 		http.Error(w, "Invalid request body", http.StatusBadRequest)
+// 		return
+// 	}
+
+// 	if data.ChatID == 0 || data.UserID == 0 || data.OriginalSender == 0 || data.OriginalChat == 0 {
+// 		http.Error(w, "Missing required fields", http.StatusBadRequest)
+// 		return
+// 	}
+
+// 	db, err := connectDB()
+// 	if err != nil {
+// 		http.Error(w, "Database error", http.StatusInternalServerError)
+// 		return
+// 	}
+// 	defer db.Close()
+
+// 	var messageID int
+// 	err = db.QueryRow(`
+//         INSERT INTO messages (chat_id, user_id, content, is_forwarded, original_sender_id, original_chat_id)
+//         VALUES ($1, $2, $3, true, $4, $5) RETURNING id
+//     `, data.ChatID, data.UserID, data.Text, data.OriginalSender, data.OriginalChat).Scan(&messageID)
+// 	if err != nil {
+// 		http.Error(w, "Failed to insert message", http.StatusInternalServerError)
+// 		return
+// 	}
+
+// 	// После вставки сообщения
+// var originalSenderName string
+// err = db.QueryRow("SELECT username FROM users WHERE id = $1", data.OriginalSender).Scan(&originalSenderName)
+// if err != nil {
+//     log.Printf("Ошибка получения имени отправителя: %v", err)
+//     originalSenderName = "Unknown"
+// }
+// message["original_sender_name"] = originalSenderName
+
+// 	// Подготовка сообщения для рассылки
+// 	message := map[string]interface{}{
+// 		"id":                 messageID,
+// 		"chat_id":            data.ChatID,
+// 		"user_id":            data.UserID,
+// 		"text":               data.Text,
+// 		"created_at":         time.Now().Format(time.RFC3339),
+// 		"is_forwarded":       true,
+// 		"original_sender_id": data.OriginalSender,
+// 		"original_chat_id":   data.OriginalChat,
+// 	}
+
+// 	// Рассылка всем клиентам в целевом чате
+// 	clientsMu.Lock()
+// 	for client, info := range clients {
+// 		if info.chatID == data.ChatID {
+// 			client.WriteJSON(message)
+// 		}
+// 	}
+// 	clientsMu.Unlock()
+
+//		w.WriteHeader(http.StatusOK)
+//		w.Write([]byte("Message forwarded successfully"))
+//	}
+func forwardMessage(w http.ResponseWriter, r *http.Request) {
+	var data struct {
+		ChatID         int    `json:"chat_id"`
+		UserID         int    `json:"user_id"`
+		Text           string `json:"text"`
+		OriginalSender *int   `json:"original_sender_id"` // Изменяем на указатель
+		OriginalChat   *int   `json:"original_chat_id"`   // Изменяем на указатель
+	}
+	if err := json.NewDecoder(r.Body).Decode(&data); err != nil {
+		log.Printf("Ошибка декодирования тела запроса: %v", err)
+		http.Error(w, "Invalid request body", http.StatusBadRequest)
+		return
+	}
+	log.Printf("Получены данные для пересылки: %+v", data)
+
+	if data.ChatID == 0 || data.UserID == 0 {
+		log.Printf("Отсутствуют обязательные поля: chat_id или user_id")
+		http.Error(w, "Missing required fields", http.StatusBadRequest)
+		return
+	}
+
+	db, err := connectDB()
+	if err != nil {
+		log.Printf("Ошибка подключения к БД: %v", err)
+		http.Error(w, "Database error", http.StatusInternalServerError)
+		return
+	}
+	defer db.Close()
+
+	var originalSender sql.NullInt64
+	if data.OriginalSender != nil {
+		originalSender.Int64 = int64(*data.OriginalSender)
+		originalSender.Valid = true
+	}
+	var originalChat sql.NullInt64
+	if data.OriginalChat != nil {
+		originalChat.Int64 = int64(*data.OriginalChat)
+		originalChat.Valid = true
+	}
+
+	var messageID int
+	err = db.QueryRow(`
+	  INSERT INTO messages (chat_id, user_id, content, is_forwarded, original_sender_id, original_chat_id)
+	  VALUES ($1, $2, $3, true, $4, $5) RETURNING id
+	`, data.ChatID, data.UserID, data.Text, originalSender, originalChat).Scan(&messageID)
+	if err != nil {
+		log.Printf("Ошибка вставки сообщения в БД: %v", err)
+		http.Error(w, "Failed to insert message", http.StatusInternalServerError)
+		return
+	}
+	log.Printf("Сообщение успешно вставлено с ID: %d", messageID)
+
+	var originalSenderName string
+	if originalSender.Valid {
+		err = db.QueryRow("SELECT username FROM users WHERE id = $1", originalSender.Int64).Scan(&originalSenderName)
+		if err != nil {
+			log.Printf("Ошибка получения имени оригинального отправителя: %v", err)
+			originalSenderName = "Unknown"
+		}
+	} else {
+		originalSenderName = ""
+	}
+	log.Printf("Имя оригинального отправителя: %s", originalSenderName)
+
+	message := map[string]interface{}{
+		"id":           messageID,
+		"chat_id":      data.ChatID,
+		"user_id":      data.UserID,
+		"text":         data.Text,
+		"created_at":   time.Now().Format(time.RFC3339),
+		"is_forwarded": true,
+	}
+	if originalSender.Valid {
+		message["original_sender_id"] = originalSender.Int64
+		message["original_sender_name"] = originalSenderName
+	}
+	if originalChat.Valid {
+		message["original_chat_id"] = originalChat.Int64
+	}
+
+	clientsMu.Lock()
+	log.Printf("Рассылка пересланного сообщения клиентам в чате %d", data.ChatID)
+	for client, info := range clients {
+		if info.chatID == data.ChatID {
+			err := client.WriteJSON(message)
+			if err != nil {
+				log.Printf("Ошибка отправки сообщения клиенту: %v", err)
+				client.Close()
+				delete(clients, client)
+			}
+		}
+	}
+	clientsMu.Unlock()
+
+	log.Printf("Пересылка сообщения успешно завершена")
+	w.WriteHeader(http.StatusOK)
+	w.Write([]byte("Message forwarded successfully"))
 }

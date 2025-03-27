@@ -35,6 +35,7 @@ func main() {
 	http.HandleFunc("/user/profile", enableCORS(userProfileHandler))
 	http.HandleFunc("/group-chats", enableCORS(createGroupChatHandler))
 	http.HandleFunc("/all-users", enableCORS(allUsersHandler))
+	http.HandleFunc("/forward-message", enableCORS(forwardMessage))
 
 	fmt.Println("Server starting on :8080")
 	log.Fatal(http.ListenAndServe("0.0.0.0:8080", nil))
