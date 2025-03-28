@@ -232,7 +232,7 @@ func messagesHandler(w http.ResponseWriter, r *http.Request) {
 	  SELECT 
 		  m.id, m.content, m.created_at, m.user_id, m.is_system,
 		  m.parent_message_id, m.is_forwarded, m.original_sender_id, m.original_chat_id,
-		  u.username AS sender_name, pm.content AS parent_content, pu.username AS parent_sender,
+		  u.name AS sender_name, pm.content AS parent_content, pu.username AS parent_sender,
 		  ou.username AS original_sender_name
 	  FROM messages m
 	  LEFT JOIN users u ON m.user_id = u.id
