@@ -19,12 +19,6 @@ import (
 	//"github.com/gorilla/websocket"
 )
 
-// Настройка WebSocket апгрейдера с разрешением всех Origin (только для разработки!)
-// websocket.Upgrader - структура из пакета gorilla/websocket, которая:
-// Конвертирует обычное HTTP-соединение в WebSocket
-// Настраивает параметры "рукопожатия" (handshake)
-// Контролирует политики безопасности
-
 // Origin - HTTP-заголовок, который браузеры автоматически добавляют к WebSocket-запросам
 // Указывает домен, с которого пришел запрос (например: https://my-site.com)
 var upgrader = websocket.Upgrader{
@@ -449,4 +443,228 @@ func createGroupChatHandler(w http.ResponseWriter, r *http.Request) {
 		"chat_id":  chatID,
 		"is_group": isGroup,
 	})
+}
+
+func broadcastNewChat(chatID int, userIDs []int) {
+	newChatMessage := map[string]interface{}{
+		"type":     "new_chat",
+		"chat_id":  chatID,
+		"is_group": false,
+		"user_ids": userIDs,
+	}
+
+	clientsMu.Lock()
+	defer clientsMu.Unlock()
+	log.Printf("Рассылка уведомления о новом чате %d участникам: %v", chatID, userIDs)
+
+	for client, info := range clients {
+		for _, userID := range userIDs {
+			if info.userID == userID {
+				err := client.WriteJSON(newChatMessage)
+				if err != nil {
+					log.Printf("Ошибка отправки уведомления клиенту [%d]: %v", info.userID, err)
+					client.Close()
+					delete(clients, client)
+				}
+				break
+			}
+		}
+	}
+}
+
+func chatsHandler(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case "GET":
+		getChatsHandler(w, r)
+	case "POST":
+		createChatHandler(w, r)
+	default:
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+func createChatHandler(w http.ResponseWriter, r *http.Request) {
+	// Получаем ID текущего пользователя и собеседника из параметров запроса
+	currentUserIDStr := r.FormValue("current_user_id")
+	targetUserIDStr := r.FormValue("user_id")
+
+	currentUserID, err := strconv.Atoi(currentUserIDStr)
+	if err != nil {
+		http.Error(w, "Invalid current_user_id", http.StatusBadRequest)
+		return
+	}
+	targetUserID, err := strconv.Atoi(targetUserIDStr)
+	if err != nil {
+		http.Error(w, "Invalid user_id", http.StatusBadRequest)
+		return
+	}
+
+	db, err := connectDB()
+	if err != nil {
+		http.Error(w, "Database error", http.StatusInternalServerError)
+		return
+	}
+	defer db.Close()
+
+	tx, err := db.Begin()
+	if err != nil {
+		http.Error(w, "Transaction error", http.StatusInternalServerError)
+		return
+	}
+
+	var chatID int
+	if err := tx.QueryRow("INSERT INTO chats DEFAULT VALUES RETURNING id").Scan(&chatID); err != nil {
+		tx.Rollback()
+		http.Error(w, "Chat creation failed", http.StatusInternalServerError)
+		return
+	}
+
+	if _, err := tx.Exec("INSERT INTO participants (chat_id, user_id) VALUES ($1, $2), ($1, $3)",
+		chatID, currentUserID, targetUserID); err != nil {
+		tx.Rollback()
+		http.Error(w, "Participants error", http.StatusInternalServerError)
+		return
+	}
+
+	if _, err := tx.Exec("INSERT INTO messages (chat_id, content, is_system) VALUES ($1, $2, true)",
+		chatID, "Чат создан"); err != nil {
+		tx.Rollback()
+		http.Error(w, "System message error", http.StatusInternalServerError)
+		return
+	}
+
+	if err := tx.Commit(); err != nil {
+		http.Error(w, "Transaction commit failed", http.StatusInternalServerError)
+		return
+	}
+
+	// Собираем список участников для уведомления
+	userIDs := []int{currentUserID, targetUserID}
+
+	// Отправляем уведомление о новом чате через WebSocket
+	broadcastNewChat(chatID, userIDs)
+
+	// Возвращаем успешный ответ
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]int{"chatId": chatID})
+}
+
+func getChatsHandler(w http.ResponseWriter, r *http.Request) {
+	currentUserID := r.URL.Query().Get("user_id")
+	if currentUserID == "" {
+		http.Error(w, "User ID is required", http.StatusBadRequest)
+		return
+	}
+
+	db, err := connectDB()
+	if err != nil {
+		http.Error(w, "Database error", http.StatusInternalServerError)
+		return
+	}
+	defer db.Close()
+
+	// Исправленный SQL-запрос без комментариев и с правильными JOIN
+	rows, err := db.Query(`
+        SELECT 
+            c.id AS chat_id,
+            c.last_message_at,
+            p.unread_count,
+            m.content AS last_message,
+            CASE
+                WHEN c.is_group THEN gc.name
+                ELSE u.name
+            END AS chat_name,
+            CASE
+                WHEN c.is_group THEN NULL
+                ELSE u.id
+            END AS partner_id,
+            c.is_group,
+            gc.image as group_image,
+            u.name as partner_name
+        FROM participants p
+        JOIN chats c ON p.chat_id = c.id
+        LEFT JOIN (
+            SELECT DISTINCT ON (chat_id) chat_id, content 
+            FROM messages 
+            ORDER BY chat_id, created_at DESC
+        ) m ON m.chat_id = c.id
+        LEFT JOIN group_chats gc ON gc.chat_id = c.id AND c.is_group
+        LEFT JOIN participants p2 ON p2.chat_id = c.id AND p2.user_id != $1 AND NOT c.is_group
+        LEFT JOIN users u ON u.id = p2.user_id
+        WHERE p.user_id = $1
+        ORDER BY c.last_message_at DESC
+    `, currentUserID)
+
+	if err != nil {
+		log.Printf("Query error: %v", err)
+		http.Error(w, "Database query error", http.StatusInternalServerError)
+		return
+	}
+	defer rows.Close()
+
+	var chats []map[string]interface{}
+	for rows.Next() {
+		var (
+			chatID      int
+			timestamp   sql.NullTime
+			unreadCount int
+			lastMessage sql.NullString
+			chatName    sql.NullString
+			partnerID   sql.NullInt64
+			isGroup     bool
+			groupImage  []byte
+			partnerName sql.NullString
+		)
+
+		if err := rows.Scan(
+			&chatID,
+			&timestamp,
+			&unreadCount,
+			&lastMessage,
+			&chatName,
+			&partnerID,
+			&isGroup,
+			&groupImage,
+			&partnerName,
+		); err != nil {
+			log.Printf("Scan error: %v", err)
+			continue
+		}
+
+		chatData := map[string]interface{}{
+			"id":          chatID,
+			"lastMessage": lastMessage.String,
+			"unread":      unreadCount,
+			"timestamp":   timestamp.Time,
+			"chat_name":   chatName.String,
+			"is_group":    isGroup,
+		}
+
+		if isGroup {
+			if len(groupImage) > 0 {
+				chatData["group_image"] = groupImage
+			}
+		} else {
+			if partnerID.Valid {
+				chatData["partner_id"] = partnerID.Int64
+			}
+			if partnerName.Valid {
+				chatData["partner_name"] = partnerName.String
+			}
+		}
+
+		chats = append(chats, chatData)
+	}
+
+	if err := rows.Err(); err != nil {
+		log.Printf("Rows error: %v", err)
+		http.Error(w, "Error processing results", http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	if err := json.NewEncoder(w).Encode(chats); err != nil {
+		log.Printf("JSON encode error: %v", err)
+		http.Error(w, "Error encoding response", http.StatusInternalServerError)
+	}
 }

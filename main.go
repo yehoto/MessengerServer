@@ -31,7 +31,7 @@ func main() {
 	http.HandleFunc("/add-reaction", enableCORS(addReactionHandler))
 	http.HandleFunc("/get-reactions", enableCORS(getReactionsHandler))
 	http.HandleFunc("/uploadFile", enableCORS(uploadFileHandler))
-	http.HandleFunc("/user-status", enableCORS(getUserStatusHandler))
+	//http.HandleFunc("/user-status", enableCORS(getUserStatusHandler))
 	http.HandleFunc("/user/profile", enableCORS(userProfileHandler))
 	http.HandleFunc("/group-chats", enableCORS(createGroupChatHandler))
 	http.HandleFunc("/all-users", enableCORS(allUsersHandler))

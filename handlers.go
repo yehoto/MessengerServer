@@ -163,136 +163,16 @@ func usersHandler(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(users)
 }
 
-func chatsHandler(w http.ResponseWriter, r *http.Request) {
-	switch r.Method {
-	case "GET":
-		getChatsHandler(w, r)
-	case "POST":
-		createChatHandler(w, r)
-	default:
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-	}
-}
-
-func getChatsHandler(w http.ResponseWriter, r *http.Request) {
-	currentUserID := r.URL.Query().Get("user_id")
-	if currentUserID == "" {
-		http.Error(w, "User ID is required", http.StatusBadRequest)
-		return
-	}
-
-	db, err := connectDB()
-	if err != nil {
-		http.Error(w, "Database error", http.StatusInternalServerError)
-		return
-	}
-	defer db.Close()
-
-	// Исправленный SQL-запрос без комментариев и с правильными JOIN
-	rows, err := db.Query(`
-        SELECT 
-            c.id AS chat_id,
-            c.last_message_at,
-            p.unread_count,
-            m.content AS last_message,
-            CASE
-                WHEN c.is_group THEN gc.name
-                ELSE u.name
-            END AS chat_name,
-            CASE
-                WHEN c.is_group THEN NULL
-                ELSE u.id
-            END AS partner_id,
-            c.is_group,
-            gc.image as group_image,
-            u.name as partner_name
-        FROM participants p
-        JOIN chats c ON p.chat_id = c.id
-        LEFT JOIN (
-            SELECT DISTINCT ON (chat_id) chat_id, content 
-            FROM messages 
-            ORDER BY chat_id, created_at DESC
-        ) m ON m.chat_id = c.id
-        LEFT JOIN group_chats gc ON gc.chat_id = c.id AND c.is_group
-        LEFT JOIN participants p2 ON p2.chat_id = c.id AND p2.user_id != $1 AND NOT c.is_group
-        LEFT JOIN users u ON u.id = p2.user_id
-        WHERE p.user_id = $1
-        ORDER BY c.last_message_at DESC
-    `, currentUserID)
-
-	if err != nil {
-		log.Printf("Query error: %v", err)
-		http.Error(w, "Database query error", http.StatusInternalServerError)
-		return
-	}
-	defer rows.Close()
-
-	var chats []map[string]interface{}
-	for rows.Next() {
-		var (
-			chatID      int
-			timestamp   sql.NullTime
-			unreadCount int
-			lastMessage sql.NullString
-			chatName    sql.NullString
-			partnerID   sql.NullInt64
-			isGroup     bool
-			groupImage  []byte
-			partnerName sql.NullString
-		)
-
-		if err := rows.Scan(
-			&chatID,
-			&timestamp,
-			&unreadCount,
-			&lastMessage,
-			&chatName,
-			&partnerID,
-			&isGroup,
-			&groupImage,
-			&partnerName,
-		); err != nil {
-			log.Printf("Scan error: %v", err)
-			continue
-		}
-
-		chatData := map[string]interface{}{
-			"id":          chatID,
-			"lastMessage": lastMessage.String,
-			"unread":      unreadCount,
-			"timestamp":   timestamp.Time,
-			"chat_name":   chatName.String,
-			"is_group":    isGroup,
-		}
-
-		if isGroup {
-			if len(groupImage) > 0 {
-				chatData["group_image"] = groupImage
-			}
-		} else {
-			if partnerID.Valid {
-				chatData["partner_id"] = partnerID.Int64
-			}
-			if partnerName.Valid {
-				chatData["partner_name"] = partnerName.String
-			}
-		}
-
-		chats = append(chats, chatData)
-	}
-
-	if err := rows.Err(); err != nil {
-		log.Printf("Rows error: %v", err)
-		http.Error(w, "Error processing results", http.StatusInternalServerError)
-		return
-	}
-
-	w.Header().Set("Content-Type", "application/json")
-	if err := json.NewEncoder(w).Encode(chats); err != nil {
-		log.Printf("JSON encode error: %v", err)
-		http.Error(w, "Error encoding response", http.StatusInternalServerError)
-	}
-}
+// func chatsHandler(w http.ResponseWriter, r *http.Request) {
+// 	switch r.Method {
+// 	case "GET":
+// 		getChatsHandler(w, r)
+// 	case "POST":
+// 		createChatHandler(w, r)
+// 	default:
+// 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+// 	}
+// }
 
 func userImageHandler(w http.ResponseWriter, r *http.Request) {
 	userID := r.URL.Query().Get("id")
@@ -315,51 +195,6 @@ func userImageHandler(w http.ResponseWriter, r *http.Request) {
 	w.Write(imageBytes)
 }
 
-func createChatHandler(w http.ResponseWriter, r *http.Request) {
-	// Получаем ID текущего пользователя из параметров запроса
-	currentUserID := r.FormValue("current_user_id")
-	targetUserID := r.FormValue("user_id")
-
-	//currentUserID := 1 // TODO: Заменить на реальный ID
-	//targetUserID := r.FormValue("user_id")
-
-	db, err := connectDB()
-	if err != nil {
-		http.Error(w, "Database error", http.StatusInternalServerError)
-		return
-	}
-	defer db.Close()
-
-	tx, err := db.Begin()
-	if err != nil {
-		http.Error(w, "Transaction error", http.StatusInternalServerError)
-		return
-	}
-
-	var chatID int
-	if err := tx.QueryRow("INSERT INTO chats DEFAULT VALUES RETURNING id").Scan(&chatID); err != nil {
-		tx.Rollback()
-		http.Error(w, "Chat creation failed", http.StatusInternalServerError)
-		return
-	}
-
-	if _, err := tx.Exec("INSERT INTO participants (chat_id, user_id) VALUES ($1, $2), ($1, $3)",
-		chatID, currentUserID, targetUserID); err != nil {
-		tx.Rollback()
-		http.Error(w, "Participants error", http.StatusInternalServerError)
-		return
-	}
-
-	if _, err := tx.Exec("INSERT INTO messages (chat_id, content, is_system) VALUES ($1, $2, true)",
-		chatID, "Чат создан"); err != nil {
-		tx.Rollback()
-		http.Error(w, "System message error", http.StatusInternalServerError)
-		return
-	}
-
-	tx.Commit()
-	json.NewEncoder(w).Encode(map[string]int{"chatId": chatID})
-}
 func messagesHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != "GET" {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
