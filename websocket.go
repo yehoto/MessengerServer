@@ -19,8 +19,6 @@ import (
 	//"github.com/gorilla/websocket"
 )
 
-// Origin - HTTP-заголовок, который браузеры автоматически добавляют к WebSocket-запросам
-// Указывает домен, с которого пришел запрос (например: https://my-site.com)
 var upgrader = websocket.Upgrader{
 	CheckOrigin: func(r *http.Request) bool {
 		log.Printf("Разрешен запрос от origin: %s", r.Header.Get("Origin"))
@@ -35,11 +33,6 @@ type clientInfo struct {
 
 var clients = make(map[*websocket.Conn]clientInfo)
 
-// Хранилище подключенных клиентов и мьютекс для безопасности
-// var clients = make(map[*websocket.Conn]bool) //bool - соединение активно/нет, но в реализации особо не нужно
-// Мьютекс — это примитив синхронизации, который позволяет:
-// Блокировать доступ к данным, если их использует другая горутина.
-// Разблокировать доступ, когда работа с данными завершена.
 var clientsMu sync.Mutex
 
 // Хранилище статусов пользователей и мьютекс
@@ -59,7 +52,7 @@ func updateUserStatus(userID int, online bool) {
 
 // Рассылка статуса пользователя всем клиентам
 func broadcastUserStatus(userID int, online bool) {
-	statusMessage := map[string]interface{}{ //Тип interface{} в Go используется для создания переменных, которые могут хранить значения любого типа.
+	statusMessage := map[string]interface{}{
 		"type":    "user_status",
 		"user_id": userID,
 		"online":  online,
