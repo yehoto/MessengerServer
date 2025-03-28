@@ -968,3 +968,24 @@ func getGroupParticipantsCountHandler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(response)
 }
+
+func groupImageHandler(w http.ResponseWriter, r *http.Request) {
+	chatID := r.URL.Query().Get("chat_id")
+
+	db, err := connectDB()
+	if err != nil {
+		http.Error(w, "Database error", http.StatusInternalServerError)
+		return
+	}
+	defer db.Close()
+
+	var imageBytes []byte
+	err = db.QueryRow("SELECT image FROM group_chats WHERE chat_id = $1", chatID).Scan(&imageBytes)
+	if err != nil || len(imageBytes) == 0 {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+
+	w.Header().Set("Content-Type", "image/jpeg")
+	w.Write(imageBytes)
+}
