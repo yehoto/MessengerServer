@@ -2,7 +2,9 @@ package main
 
 import (
 	"database/sql"
+	"encoding/base64"
 	"encoding/json"
+	"io"
 	"log"
 	"net/http"
 	"strconv"
@@ -10,35 +12,30 @@ import (
 	"sync"
 	"time"
 
-	"encoding/base64"
-
 	"github.com/gorilla/websocket"
-
-	"io"
-	//"database/sql"
-	//"github.com/gorilla/websocket"
 )
 
 var upgrader = websocket.Upgrader{
-	CheckOrigin: func(r *http.Request) bool {
-		log.Printf("Разрешен запрос от origin: %s", r.Header.Get("Origin"))
-		return true
-	},
+	ReadBufferSize:  1024,
+	WriteBufferSize: 1024,
+	// Явно разрешаем все origin
+	CheckOrigin: func(r *http.Request) bool { return true },
 }
 
+// Структура для хранения информации о клиенте WebSocket
 type clientInfo struct {
 	userID int
 	chatID int
 }
 
-var clients = make(map[*websocket.Conn]clientInfo)
+var clients = make(map[*websocket.Conn]clientInfo) // Карта подключенных клиентов
 
-var clientsMu sync.Mutex
+var clientsMu sync.Mutex // Мьютекс для безопасного доступа к карте clients
 
 // Хранилище статусов пользователей и мьютекс
 var (
 	userStatuses = make(map[int]bool)
-	userStatusMu sync.Mutex
+	userStatusMu sync.Mutex // Мьютекс для синхронизации доступа
 )
 
 // Обновление статуса пользователя с логированием
@@ -52,6 +49,7 @@ func updateUserStatus(userID int, online bool) {
 
 // Рассылка статуса пользователя всем клиентам
 func broadcastUserStatus(userID int, online bool) {
+	// Формируем сообщение о статусе
 	statusMessage := map[string]interface{}{
 		"type":    "user_status",
 		"user_id": userID,
@@ -61,10 +59,11 @@ func broadcastUserStatus(userID int, online bool) {
 	clientsMu.Lock()
 	defer clientsMu.Unlock()
 	log.Printf("Рассылка статуса пользователя %d (%t) для %d клиентов", userID, online, len(clients))
-
+	// Отправляем сообщение всем подключенным клиентам
 	for client := range clients {
 		err := client.WriteJSON(statusMessage)
 		if err != nil {
+			// При ошибке закрываем соединение и удаляем клиента
 			log.Printf("Ошибка отправки [%d]: %v", userID, err)
 			client.Close()
 			delete(clients, client)
@@ -74,26 +73,28 @@ func broadcastUserStatus(userID int, online bool) {
 
 // Обработчик WebSocket соединений
 func handleWebSocket(w http.ResponseWriter, r *http.Request) {
+	// Обновляем HTTP соединение до WebSocket
 	conn, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
 		log.Printf("Ошибка апгрейда WebSocket: %v", err)
 		return
 	}
-	defer conn.Close()
-
+	defer conn.Close() // Гарантированное закрытие соединения при выходе
+	// Получаем параметры из URL
 	userIDStr := r.URL.Query().Get("user_id")
 	userID, _ := strconv.Atoi(userIDStr)
 	chatIDStr := r.URL.Query().Get("chat_id")
 	chatID, _ := strconv.Atoi(chatIDStr)
 	log.Printf("Подключение WebSocket: user_id=%d, chat_id=%d", userID, chatID)
-
+	// Регистрируем нового клиента
 	clientsMu.Lock()
 	clients[conn] = clientInfo{userID: userID, chatID: chatID}
 	clientsMu.Unlock()
-
+	// Обновляем статус пользователя
 	updateUserStatus(userID, true)
 	broadcastUserStatus(userID, true)
 
+	// Бесконечный цикл обработки входящих сообщений
 	for {
 		_, message, err := conn.ReadMessage()
 		if err != nil {
@@ -102,6 +103,29 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		}
 		log.Printf("Получено сообщение через WebSocket: %s", string(message))
 
+		// Пытаемся распарсить сообщение как команду
+		var command struct {
+			Type      string `json:"type"`
+			MessageID int    `json:"message_id"`
+			UserID    int    `json:"user_id"`
+			NewText   string `json:"new_text"`
+		}
+
+		if err := json.Unmarshal(message, &command); err == nil && command.Type != "" {
+			switch command.Type {
+			case "delete_for_me":
+				handleDeleteForMeCommand(conn, command.MessageID, command.UserID)
+				continue
+			case "delete_for_everyone":
+				handleDeleteForEveryoneCommand(conn, command.MessageID, command.UserID)
+				continue
+			case "edit_message":
+				handleEditMessageCommand(conn, command.MessageID, command.UserID, command.NewText)
+				continue
+			}
+		}
+
+		// Если не команда, обрабатываем как обычное сообщение
 		var msgData struct {
 			ChatID           int    `json:"chat_id"`
 			UserID           int    `json:"user_id"`
@@ -116,12 +140,13 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 
+		// Подключаемся к базе данных
 		db, err := connectDB()
 		if err != nil {
 			log.Printf("Ошибка подключения к БД в WebSocket: %v", err)
 			continue
 		}
-
+		// Подготовка данных для SQL-запроса
 		var parentMessageID sql.NullInt64
 		if msgData.ParentMessageID != nil {
 			parentMessageID.Int64 = int64(*msgData.ParentMessageID)
@@ -138,6 +163,7 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 			originalChatID.Valid = true
 		}
 
+		// Сохраняем сообщение в базу данных
 		var messageID int
 		err = db.QueryRow(
 			"INSERT INTO messages (chat_id, user_id, content, parent_message_id, is_forwarded, original_sender_id, original_chat_id) VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id",
@@ -148,14 +174,14 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 			db.Close()
 			continue
 		}
-
+		// Получаем имя отправителя
 		var senderName string
 		err = db.QueryRow("SELECT username FROM users WHERE id = $1", msgData.UserID).Scan(&senderName)
 		if err != nil {
 			log.Printf("Ошибка получения имени отправителя: %v", err)
 			senderName = "Unknown"
 		}
-
+		// Формируем объект сообщения для рассылки
 		msgDataMap := map[string]interface{}{
 			"id":                 messageID,
 			"chat_id":            msgData.ChatID,
@@ -169,6 +195,7 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 			"original_sender_id": msgData.OriginalSenderID,
 			"original_chat_id":   msgData.OriginalChatID,
 		}
+		// Если есть родительское сообщение, получаем его текст
 		if msgData.ParentMessageID != nil {
 			var parentContent string
 			err := db.QueryRow("SELECT content FROM messages WHERE id = $1", *msgData.ParentMessageID).Scan(&parentContent)
@@ -179,7 +206,7 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 
-		// Получаем список участников чата
+		// Получаем участников чата из базы данных
 		rows, err := db.Query("SELECT user_id FROM participants WHERE chat_id = $1", msgData.ChatID)
 		if err != nil {
 			log.Printf("Ошибка получения участников чата: %v", err)
@@ -188,8 +215,8 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		}
 		defer rows.Close()
 
-		var participantIDs []int
-		for rows.Next() {
+		var participantIDs []int // Создаем пустой срез для хранения ID участников чата
+		for rows.Next() {        // Итерируем по строкам результата SQL-запрос
 			var participantID int
 			if err := rows.Scan(&participantID); err != nil {
 				log.Printf("Ошибка сканирования participant_id: %v", err)
@@ -225,6 +252,7 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	log.Printf("Клиент отключен: user_id=%d", userID)
 	updateUserStatus(userID, false)
 	broadcastUserStatus(userID, false)
+	// Удаляем клиента из списка
 	clientsMu.Lock()
 	delete(clients, conn)
 	clientsMu.Unlock()
@@ -246,23 +274,6 @@ func getUserStatusHandler(w http.ResponseWriter, r *http.Request) {
 
 	log.Printf("Запрос статуса [%d]: %t", userID, online)
 	json.NewEncoder(w).Encode(map[string]bool{"online": online})
-}
-
-// Отправка статуса конкретному клиенту
-func sendUserStatus(conn *websocket.Conn, userID int, online bool) {
-	statusMessage := map[string]interface{}{
-		"type":    "user_status",
-		"user_id": userID,
-		"online":  online,
-	}
-
-	log.Printf("Отправка статуса [%d:%t] клиенту [%v]", userID, online, conn.RemoteAddr())
-	err := conn.WriteJSON(statusMessage)
-	if err != nil {
-		log.Printf("Ошибка отправки статуса [%d]: %v", userID, err)
-		conn.Close()
-		delete(clients, conn)
-	}
 }
 
 // Функция для рассылки уведомления о создании группы
@@ -295,9 +306,10 @@ func broadcastNewGroup(chatID int, chatName string, userIDs []int, groupImage st
 		}
 	}
 }
+
 func createGroupChatHandler(w http.ResponseWriter, r *http.Request) {
-	// Парсим форму (включая файлы)
-	err := r.ParseMultipartForm(10 << 20) // 10 MB
+	// Парсинг формы с поддержкой файлов (10 МБ - лимит)
+	err := r.ParseMultipartForm(10 << 20) // 10 << 20 = 10 * 2^20 = 10,485,760 байт
 	if err != nil {
 		http.Error(w, "Unable to parse form", http.StatusBadRequest)
 		return
@@ -480,7 +492,7 @@ func createChatHandler(w http.ResponseWriter, r *http.Request) {
 	// Получаем ID текущего пользователя и собеседника из параметров запроса
 	currentUserIDStr := r.FormValue("current_user_id")
 	targetUserIDStr := r.FormValue("user_id")
-
+	// Получение параметров из формы
 	currentUserID, err := strconv.Atoi(currentUserIDStr)
 	if err != nil {
 		http.Error(w, "Invalid current_user_id", http.StatusBadRequest)
@@ -504,21 +516,21 @@ func createChatHandler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Transaction error", http.StatusInternalServerError)
 		return
 	}
-
+	// Создание чата (is_group=false по умолчанию)
 	var chatID int
 	if err := tx.QueryRow("INSERT INTO chats DEFAULT VALUES RETURNING id").Scan(&chatID); err != nil {
 		tx.Rollback()
 		http.Error(w, "Chat creation failed", http.StatusInternalServerError)
 		return
 	}
-
+	// Добавление участников
 	if _, err := tx.Exec("INSERT INTO participants (chat_id, user_id) VALUES ($1, $2), ($1, $3)",
 		chatID, currentUserID, targetUserID); err != nil {
 		tx.Rollback()
 		http.Error(w, "Participants error", http.StatusInternalServerError)
 		return
 	}
-
+	// Системное сообщение о создании
 	if _, err := tx.Exec("INSERT INTO messages (chat_id, content, is_system) VALUES ($1, $2, true)",
 		chatID, "Чат создан"); err != nil {
 		tx.Rollback()
@@ -556,7 +568,7 @@ func getChatsHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	defer db.Close()
 
-	// Исправленный SQL-запрос без комментариев и с правильными JOIN
+	// Сложный SQL-запрос для получения чатов:
 	rows, err := db.Query(`
         SELECT 
             c.id AS chat_id,
@@ -623,7 +635,7 @@ func getChatsHandler(w http.ResponseWriter, r *http.Request) {
 			log.Printf("Scan error: %v", err)
 			continue
 		}
-
+		// Формирование объекта чата
 		chatData := map[string]interface{}{
 			"id":          chatID,
 			"lastMessage": lastMessage.String,
@@ -660,4 +672,156 @@ func getChatsHandler(w http.ResponseWriter, r *http.Request) {
 		log.Printf("JSON encode error: %v", err)
 		http.Error(w, "Error encoding response", http.StatusInternalServerError)
 	}
+}
+
+func broadcastMessageDeletion(messageID int) {
+	deletionMsg := map[string]interface{}{
+		"type": "message_deleted",
+		"id":   messageID,
+	}
+
+	clientsMu.Lock()
+	defer clientsMu.Unlock()
+
+	for client := range clients {
+		err := client.WriteJSON(deletionMsg)
+		if err != nil {
+			log.Printf("Broadcast deletion error: %v", err)
+			client.Close()
+			delete(clients, client)
+		}
+	}
+}
+
+func broadcastMessageEdit(chatID, messageID int, newText string, editedAt time.Time) {
+	editMsg := map[string]interface{}{
+		"type":      "message_edited",
+		"id":        messageID,
+		"chat_id":   chatID,
+		"new_text":  newText,
+		"edited_at": editedAt.Format(time.RFC3339),
+	}
+
+	clientsMu.Lock()
+	defer clientsMu.Unlock()
+	log.Printf("Broadcasting message edit: %+v", editMsg)
+
+	for client, info := range clients {
+		// Отправляем только участникам этого чата
+		if info.chatID == chatID {
+			log.Printf("Sending edit notification to user %d in chat %d", info.userID, chatID)
+			err := client.WriteJSON(editMsg)
+			if err != nil {
+				log.Printf("Broadcast edit error to user %d: %v", info.userID, err)
+				client.Close()
+				delete(clients, client)
+			}
+		}
+	}
+}
+
+func handleDeleteForEveryoneCommand(conn *websocket.Conn, messageID, userID int) {
+	db, err := connectDB()
+	if err != nil {
+		log.Printf("DB error: %v", err)
+		return
+	}
+	defer db.Close()
+
+	// Проверяем, что пользователь - автор сообщения
+	var authorID int
+	err = db.QueryRow("SELECT user_id FROM messages WHERE id = $1", messageID).Scan(&authorID)
+	if err != nil || authorID != userID {
+		log.Printf("Unauthorized delete attempt: user %d tried to delete message %d", userID, messageID)
+		return
+	}
+
+	// Обновление сообщения в БД
+	_, err = db.Exec(`
+        UPDATE messages 
+        SET is_deleted = TRUE, 
+            content = 'Сообщение удалено'
+        WHERE id = $1`,
+		messageID)
+
+	if err != nil {
+		log.Printf("Delete for everyone error: %v", err)
+		return
+	}
+
+	// Рассылаем уведомление об удалении
+	broadcastMessageDeletion(messageID)
+}
+
+func handleEditMessageCommand(conn *websocket.Conn, messageID, userID int, newText string) {
+	db, err := connectDB()
+	if err != nil {
+		log.Printf("DB connection error: %v", err)
+		return
+	}
+	defer db.Close()
+
+	var chatID int
+	var authorID int
+	var editedAt time.Time
+
+	// Проверяем авторство и получаем chat_id
+	err = db.QueryRow(`
+        SELECT chat_id, user_id 
+        FROM messages 
+        WHERE id = $1`,
+		messageID,
+	).Scan(&chatID, &authorID)
+
+	if err != nil || authorID != userID {
+		log.Printf("Unauthorized edit: user %d, message %d", userID, messageID)
+		return
+	}
+
+	// Обновляем сообщение
+	err = db.QueryRow(`
+        UPDATE messages 
+        SET content = $1, 
+            is_edited = TRUE,
+            edited_at = CURRENT_TIMESTAMP
+        WHERE id = $2
+        RETURNING edited_at`,
+		newText, messageID,
+	).Scan(&editedAt)
+
+	if err != nil {
+		log.Printf("Edit error: %v", err)
+		return
+	}
+
+	broadcastMessageEdit(chatID, messageID, newText, editedAt)
+}
+func handleDeleteForMeCommand(conn *websocket.Conn, messageID, userID int) {
+	db, err := connectDB()
+	if err != nil {
+		log.Printf("DB error: %v", err)
+		return
+	}
+	defer db.Close()
+
+	// Помечаем сообщение как удаленное для этого пользователя
+	_, err = db.Exec(`
+        INSERT INTO deleted_messages (message_id, user_id)
+        VALUES ($1, $2) 
+        ON CONFLICT (message_id, user_id) DO UPDATE SET deleted = true`,
+		messageID, userID)
+
+	if err != nil {
+		log.Printf("Delete for me error: %v", err)
+		return
+	}
+
+	// Отправляем подтверждение только этому клиенту
+	confirmMsg := map[string]interface{}{
+		"type":           "message_deleted_for_me",
+		"id":             messageID,
+		"deleted_for_me": true,
+	}
+
+	conn.WriteJSON(confirmMsg)
 }

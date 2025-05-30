@@ -130,7 +130,7 @@ func usersHandler(w http.ResponseWriter, r *http.Request) {
 
 	//rows, err := db.Query("SELECT id, username FROM users")
 	currentUserID := r.URL.Query().Get("current_user_id")
-
+	// Ищем пользователей, с которыми у текущего пользователя нет чатов
 	rows, err := db.Query(`
         SELECT u.id, u.username 
         FROM users u
@@ -149,7 +149,7 @@ func usersHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer rows.Close()
-
+	// Собираем результаты
 	var users []map[string]interface{}
 	for rows.Next() {
 		var id int
@@ -190,13 +190,28 @@ func messagesHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	chatID := r.URL.Query().Get("chat_id")
-	currentUserID := r.URL.Query().Get("user_id")
-	log.Printf("Запрос сообщений: chat_id=%s, user_id=%s", chatID, currentUserID)
+	// Преобразуем параметры в int
+	chatIDStr := r.URL.Query().Get("chat_id")
+	currentUserIDStr := r.URL.Query().Get("user_id")
+	log.Printf("Запрос сообщений: chat_id=%s, user_id=%s", chatIDStr, currentUserIDStr)
 
-	if chatID == "" || currentUserID == "" {
+	if chatIDStr == "" || currentUserIDStr == "" {
 		log.Printf("Ошибка: отсутствуют chat_id или user_id")
 		http.Error(w, "Chat ID and User ID are required", http.StatusBadRequest)
+		return
+	}
+	// Конвертируем строки в числа
+	chatID, err := strconv.Atoi(chatIDStr)
+	if err != nil {
+		log.Printf("Invalid chat_id: %s", chatIDStr)
+		http.Error(w, "Invalid chat_id", http.StatusBadRequest)
+		return
+	}
+
+	currentUserID, err := strconv.Atoi(currentUserIDStr)
+	if err != nil {
+		log.Printf("Invalid user_id: %s", currentUserIDStr)
+		http.Error(w, "Invalid user_id", http.StatusBadRequest)
 		return
 	}
 
@@ -217,29 +232,47 @@ func messagesHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	log.Printf("Чат групповой: %t", isGroup)
 
-	rows, err := db.Query(`
-	  SELECT 
-		  m.id, m.content, m.created_at, m.user_id, m.is_system,
-		  m.parent_message_id, m.is_forwarded, m.original_sender_id, m.original_chat_id,
-		  u.name AS sender_name, pm.content AS parent_content, pu.username AS parent_sender,
-		  ou.username AS original_sender_name
-	  FROM messages m
-	  LEFT JOIN users u ON m.user_id = u.id
-	  LEFT JOIN messages pm ON m.parent_message_id = pm.id
-	  LEFT JOIN users pu ON pm.user_id = pu.id
-	  LEFT JOIN users ou ON m.original_sender_id = ou.id
-	  WHERE m.chat_id = $1
-	  ORDER BY m.created_at ASC
-	`, chatID)
+	// SQL-запрос для получения сообщений
+	query := `
+        SELECT 
+            m.id,
+            CASE
+                WHEN m.is_deleted THEN 'Сообщение удалено'
+                ELSE m.content
+            END AS content,
+            m.created_at, 
+            m.user_id, 
+            m.is_system,
+            m.parent_message_id, 
+            m.is_forwarded, 
+            m.original_sender_id, 
+            m.original_chat_id,
+            u.name AS sender_name,
+            pm.content AS parent_content,
+            pu.username AS parent_sender,
+            ou.username AS original_sender_name
+        FROM messages m
+        LEFT JOIN deleted_messages dm 
+            ON m.id = dm.message_id AND dm.user_id = $1
+        LEFT JOIN users u ON m.user_id = u.id
+        LEFT JOIN messages pm ON m.parent_message_id = pm.id
+        LEFT JOIN users pu ON pm.user_id = pu.id
+        LEFT JOIN users ou ON m.original_sender_id = ou.id
+        WHERE m.chat_id = $2 
+            AND dm.message_id IS NULL
+        ORDER BY m.created_at ASC`
+	// Выполняем запрос
+	rows, err := db.Query(query, currentUserID, chatID)
 	if err != nil {
 		log.Printf("Ошибка выполнения запроса к БД: %v", err)
 		http.Error(w, "Query error: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
 	defer rows.Close()
-
+	// Обрабатываем результаты
 	var messages []map[string]interface{}
 	for rows.Next() {
+		// Объявляем переменные для всех полей
 		var (
 			id                 int
 			content            string
@@ -255,7 +288,7 @@ func messagesHandler(w http.ResponseWriter, r *http.Request) {
 			parentSender       sql.NullString
 			originalSenderName sql.NullString
 		)
-
+		// Сканируем строку результата
 		if err := rows.Scan(
 			&id, &content, &createdAt, &userID, &isSystem,
 			&parentMessageID, &isForwarded, &originalSender, &originalChat,
@@ -264,10 +297,12 @@ func messagesHandler(w http.ResponseWriter, r *http.Request) {
 			log.Printf("Ошибка чтения строки результата: %v", err)
 			continue
 		}
-
-		currentUserIDInt, _ := strconv.ParseInt(currentUserID, 10, 64)
-		isMe := userID.Int64 == currentUserIDInt
-
+		// Определяем, принадлежит ли сообщение текущему пользователю
+		isMe := false
+		if userID.Valid {
+			isMe = userID.Int64 == int64(currentUserID)
+		}
+		// Формируем объект сообщения
 		messageData := map[string]interface{}{
 			"id":                   id,
 			"text":                 content,
@@ -284,6 +319,7 @@ func messagesHandler(w http.ResponseWriter, r *http.Request) {
 			"original_chat_id":     originalChat.Int64,
 			"original_sender_name": originalSenderName.String,
 		}
+
 		if senderName.Valid {
 			messageData["sender_name"] = senderName.String
 		}
@@ -296,7 +332,7 @@ func messagesHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func addReactionHandler(w http.ResponseWriter, r *http.Request) {
-	var data struct {
+	var data struct { // Декодируем JSON-тело запроса
 		MessageID int    `json:"message_id"`
 		UserID    int    `json:"user_id"`
 		Reaction  string `json:"reaction"`
@@ -313,7 +349,7 @@ func addReactionHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer db.Close()
-
+	// Вставляем или обновляем реакцию
 	_, err = db.Exec(
 		"INSERT INTO message_reactions (message_id, user_id, reaction) VALUES ($1, $2, $3) ON CONFLICT (message_id, user_id) DO UPDATE SET reaction = $3",
 		data.MessageID,
@@ -391,6 +427,7 @@ func uploadFileHandler(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 	w.Write([]byte("File uploaded successfully"))
 }
+
 func getReactionsHandler(w http.ResponseWriter, r *http.Request) {
 	messageID := r.URL.Query().Get("message_id")
 	if messageID == "" {
@@ -413,7 +450,7 @@ func getReactionsHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer rows.Close()
-
+	// Собираем реакции
 	var reactions []map[string]interface{}
 	for rows.Next() {
 		var userID int
@@ -435,54 +472,6 @@ func getReactionsHandler(w http.ResponseWriter, r *http.Request) {
 		log.Println("JSON encoding error:", err)
 		http.Error(w, "Failed to encode response", http.StatusInternalServerError)
 	}
-}
-
-func markMessageDelivered(w http.ResponseWriter, r *http.Request) {
-	messageID := r.URL.Query().Get("message_id")
-	if messageID == "" {
-		http.Error(w, "Message ID is required", http.StatusBadRequest)
-		return
-	}
-
-	db, err := connectDB()
-	if err != nil {
-		http.Error(w, "Database error", http.StatusInternalServerError)
-		return
-	}
-	defer db.Close()
-
-	_, err = db.Exec("UPDATE messages SET delivered_at = NOW() WHERE id = $1", messageID)
-	if err != nil {
-		http.Error(w, "Failed to mark message as delivered", http.StatusInternalServerError)
-		return
-	}
-
-	w.WriteHeader(http.StatusOK)
-	w.Write([]byte("Message marked as delivered"))
-}
-
-func markMessageRead(w http.ResponseWriter, r *http.Request) {
-	messageID := r.URL.Query().Get("message_id")
-	if messageID == "" {
-		http.Error(w, "Message ID is required", http.StatusBadRequest)
-		return
-	}
-
-	db, err := connectDB()
-	if err != nil {
-		http.Error(w, "Database error", http.StatusInternalServerError)
-		return
-	}
-	defer db.Close()
-
-	_, err = db.Exec("UPDATE messages SET read_at = NOW() WHERE id = $1", messageID)
-	if err != nil {
-		http.Error(w, "Failed to mark message as read", http.StatusInternalServerError)
-		return
-	}
-
-	w.WriteHeader(http.StatusOK)
-	w.Write([]byte("Message marked as read"))
 }
 
 // userProfileHandler обрабатывает запрос на получение профиля пользователя
@@ -590,6 +579,7 @@ func allUsersHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func forwardMessage(w http.ResponseWriter, r *http.Request) {
+	// Декодируем JSON-запрос
 	var data struct {
 		ChatID         int    `json:"chat_id"`
 		UserID         int    `json:"user_id"`
@@ -617,7 +607,7 @@ func forwardMessage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer db.Close()
-
+	// Обрабатываем опциональные поля
 	var originalSender sql.NullInt64
 	if data.OriginalSender != nil {
 		originalSender.Int64 = int64(*data.OriginalSender)
@@ -628,7 +618,7 @@ func forwardMessage(w http.ResponseWriter, r *http.Request) {
 		originalChat.Int64 = int64(*data.OriginalChat)
 		originalChat.Valid = true
 	}
-
+	// Вставляем пересланное сообщение
 	var messageID int
 	err = db.QueryRow(`
 	  INSERT INTO messages (chat_id, user_id, content, is_forwarded, original_sender_id, original_chat_id)
@@ -652,7 +642,7 @@ func forwardMessage(w http.ResponseWriter, r *http.Request) {
 		originalSenderName = ""
 	}
 	log.Printf("Имя оригинального отправителя: %s", originalSenderName)
-
+	// Рассылаем сообщение участникам чата через WebSocket
 	message := map[string]interface{}{
 		"id":           messageID,
 		"chat_id":      data.ChatID,
